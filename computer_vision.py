@@ -48,7 +48,7 @@ class GreenPixelTracker:
             self.camera = cv2.VideoCapture(0)
 
         if self.camera.isOpened():
-            # Reduce resolution for better performance (320x240 if you want ultra-light)
+            # Reduce resolution for better performance
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             # Drop buffering so we don't build a backlog
@@ -95,14 +95,18 @@ class GreenPixelTracker:
         self.last_green_pos_raw = None  # for ROI seeding
         self.last_fullframe_check = 0.0
 
-        # ---------- Color Detection (Green LED) - FIXED! ----------
+        # ---------- Color Detection (Green LED) ----------
         print("\n🟢 Configuring GREEN LED tracking (HSV)…")
-        # FIXED: Changed from [115-125] to [40-80] for proper green detection
         self.green_lower = np.array([40, 50, 50])  # H,S,V - Wider green range
         self.green_upper = np.array([80, 255, 255])
         self.min_area = 20  # LEDs are point sources; keep small
         print("   ✅ HSV range configured for green LED")
-        print("   ✅ IMPROVED: Using H=40-80 (proper green range)")
+        print("   ✅ Using H=40-80 (proper green range)")
+
+        # ---------- Drawing Modes ----------
+        self.BRUSH_MODE = 0
+        self.ERASER_MODE = 1
+        self.drawing_mode = self.BRUSH_MODE
 
         # ---------- Force Sensor Setup ----------
         print("\n⚡ Force sensor configuration...")
@@ -117,10 +121,12 @@ class GreenPixelTracker:
         
         self.min_thickness = 1
         self.max_thickness = 15
+        self.eraser_multiplier = 2.5  # Eraser is 2.5x larger than brush
         self.force_max = 1024
         self.sensor_max_newtons = 1.0
         print(f"   🤖 AUTO-TUNING ENABLED: Threshold adapts to sensor drift")
-        print(f"   Initial sensitivity margin: {self.sensitivity_margin} ADC above baseline (MORE SENSITIVE)")
+        print(f"   Initial sensitivity margin: {self.sensitivity_margin} ADC above baseline")
+        print(f"   Eraser size: {self.eraser_multiplier}x brush size")
 
         # ---------- BLE ----------
         self.ble_client = None
@@ -136,12 +142,14 @@ class GreenPixelTracker:
         print("\n" + "="*60)
         print("✅ SYSTEM READY")
         print("="*60)
-        print("⌨️  Keys: c=calibrate, r=reset canvas, +/-=sensitivity, q=quit")
-        print("⌨️  NEW: a=toggle auto-tune, t=test HSV tuner, m=toggle mask")
+        print("⌨️  Calibration: [C]alibrate")
+        print("⌨️  Drawing: [B]rush | [E]raser | [X]Clear canvas")
+        print("⌨️  Settings: [+/-]Sensitivity | [A]uto-tune | [R]eset")
+        print("⌨️  Debug: [M]ask | [T]HSV tuner | [Q]uit")
         print("="*60 + "\n")
 
     # ----------------------------------------------------------------
-    # NEW: HSV Tuner for finding exact color values
+    # HSV Tuner for finding exact color values
     # ----------------------------------------------------------------
     def test_color_range(self):
         """Interactive HSV tuner - adjust sliders to find your LED's exact color"""
@@ -339,7 +347,12 @@ class GreenPixelTracker:
         thickness_range = self.max_thickness - self.min_thickness
         force_above = max(0, self.force_value - self.force_threshold)
         thickness = self.min_thickness + (force_above / force_range) * thickness_range
-        return int(max(self.min_thickness, min(self.max_thickness, thickness)))
+        base_thickness = int(max(self.min_thickness, min(self.max_thickness, thickness)))
+        
+        # Make eraser larger
+        if self.drawing_mode == self.ERASER_MODE:
+            return int(base_thickness * self.eraser_multiplier)
+        return base_thickness
 
     def is_drawing_enabled(self):
         return self.force_value >= self.force_threshold
@@ -523,7 +536,7 @@ class GreenPixelTracker:
     def run(self):
         last_frame_marked = None
         last_canvas_display = None
-        show_mask = True  # NEW: Show mask by default to help debugging
+        show_mask = True  # Show mask by default to help debugging
 
         while True:
             ret, frame = self.camera.read()
@@ -548,7 +561,7 @@ class GreenPixelTracker:
                     frame_marked = frame.copy()
 
                 # Fast GREEN LED detection (ROI + top-K)
-                green_pos, mask = self.detect_green(frame)  # CHANGED: Keep the mask
+                green_pos, mask = self.detect_green(frame)
                 green_pos_smoothed = self.smooth_position(green_pos)
 
                 drawing_enabled = self.is_drawing_enabled()
@@ -567,8 +580,14 @@ class GreenPixelTracker:
                         )
                         if drawing_enabled and line_thickness > 0:
                             if self.last_draw_point is not None:
+                                # Choose color based on mode
+                                if self.drawing_mode == self.BRUSH_MODE:
+                                    color = (255, 255, 255)  # White for brush
+                                else:  # ERASER_MODE
+                                    color = (0, 0, 0)  # Black for eraser
+                                
                                 cv2.line(self.canvas, self.last_draw_point, draw_pos,
-                                         (255, 255, 255), line_thickness)
+                                         color, line_thickness)
                             self.last_draw_point = draw_pos
                         else:
                             self.last_draw_point = None
@@ -615,12 +634,21 @@ class GreenPixelTracker:
                 drawing_color = (0, 255, 255) if drawing_enabled else (128, 128, 128)
                 cv2.putText(frame_marked, drawing_text, (30, 260),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, drawing_color, 2)
+                
+                # Drawing mode indicator
+                mode_text = f"MODE: {'BRUSH' if self.drawing_mode == self.BRUSH_MODE else 'ERASER'}"
+                mode_color = (255, 255, 255) if self.drawing_mode == self.BRUSH_MODE else (0, 165, 255)
+                cv2.putText(frame_marked, mode_text, (30, 290),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2)
 
-                # NEW: Detection status
-                detection_text = "GREEN DETECTED" if green_pos is not None else "NO GREEN DETECTED"
-                detection_color = (0, 255, 0) if green_pos is not None else (0, 0, 255)
-                cv2.putText(frame_marked, detection_text, (30, 290),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, detection_color, 2)
+                # Keybinds at the bottom of the screen
+                h, w = frame_marked.shape[:2]
+                keybind_y_start = h - 80
+                cv2.rectangle(frame_marked, (0, keybind_y_start - 10), (w, h), (0, 0, 0), -1)  # Black background
+                cv2.putText(frame_marked, "KEYS: [B]rush | [E]raser | [X]Clear | [C]alibrate | [+/-]Sensitivity | [Q]uit", 
+                           (10, keybind_y_start + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame_marked, "      [R]eset | [A]uto-tune | [M]ask | [T]HSV Tuner", 
+                           (10, keybind_y_start + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
                 # Compose canvas display with cursor
                 canvas_display = self.canvas.copy()
@@ -631,20 +659,25 @@ class GreenPixelTracker:
                         max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
                     )
                     cursor_radius = max(5, line_thickness + 2)
-                    cursor_color  = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
+                    
+                    # Cursor color based on mode
+                    if self.drawing_mode == self.BRUSH_MODE:
+                        cursor_color = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
+                    else:  # ERASER_MODE
+                        cursor_color = (0, 165, 255)  # Orange for eraser
+                    
                     if not drawing_enabled:
                         cursor_color = (128, 128, 128)
+                    
                     cv2.circle(canvas_display, draw_pos, cursor_radius, cursor_color, 2)
                     cv2.circle(canvas_display, draw_pos, 3, cursor_color, -1)
 
                 last_frame_marked   = frame_marked
                 last_canvas_display = canvas_display
                 
-                # NEW: Show detection mask for debugging
+                # Show detection mask for debugging
                 if show_mask:
-                    # Resize mask to match ROI if needed, or show as-is
                     mask_display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-                    # Add helper text
                     cv2.putText(mask_display, "WHITE = Detected Green", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     cv2.putText(mask_display, "Press 'm' to hide", (10, 60),
@@ -665,6 +698,22 @@ class GreenPixelTracker:
             key = cv2.waitKey(1) & 0xFF  # small wait; pacing via fps gates
             if key == ord('q'):
                 break
+            elif key == ord('b'):
+                # Brush mode
+                self.drawing_mode = self.BRUSH_MODE
+                print("✏️  Switched to BRUSH mode")
+            elif key == ord('e'):
+                # Eraser mode
+                self.drawing_mode = self.ERASER_MODE
+                print("🧹 Switched to ERASER mode")
+            elif key == ord('x'):
+                # Clear canvas
+                if self.is_calibrated:
+                    self.canvas = self._make_clean_canvas()
+                    print("🗑️  Canvas cleared!")
+                else:
+                    print("⚠️  Calibrate first before clearing")
+                self.last_draw_point = None
             elif key == ord('c'):
                 # Enter calibration mode: show markers and start detecting
                 self.awaiting_calibration = True
@@ -705,13 +754,13 @@ class GreenPixelTracker:
                     threshold_n = self.to_newtons(self.force_threshold)
                     print(f"⬇️  Manual threshold: {self.force_threshold} ({threshold_n:.3f}N)")
             elif key == ord('m'):
-                # NEW: Toggle mask display
+                # Toggle mask display
                 show_mask = not show_mask
                 if not show_mask:
                     cv2.destroyWindow("Green Detection Mask (Debugging)")
                 print(f"🎭 Mask display: {'ON' if show_mask else 'OFF'}")
             elif key == ord('t'):
-                # NEW: Launch HSV tuner
+                # Launch HSV tuner
                 print("🎨 Launching HSV tuner...")
                 cv2.destroyAllWindows()
                 self.test_color_range()
