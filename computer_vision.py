@@ -91,8 +91,8 @@ class GreenPixelTracker:
 
         # ---------- Color Detection (Blue LED) ----------
         print("\n🔵 Configuring blue LED tracking...")
-        self.blue_lower = np.array([200, 100, 50])   # Lower bound: Hue, Saturation, Value
-        self.blue_upper = np.array([230, 255, 255])  # Upper bound
+        self.blue_lower = np.array([55, 180, 140])   # Lower bound: Hue, Saturation, Value
+        self.blue_upper = np.array([80, 255, 255])  # Upper bound
         self.min_area = 50
         print("   ✅ HSV range configured for blue LED")
         print(f"   Hue: 100-130, Saturation: 150-255, Value: 50-255")
