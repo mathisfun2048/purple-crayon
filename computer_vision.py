@@ -27,11 +27,12 @@ class GreenPixelTracker:
             self.camera = cv2.VideoCapture(0)
 
         if self.camera.isOpened():
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            # Reduce resolution for better performance
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"   ✅ Camera ready: {actual_width}x{actual_height}")
+            print(f"   ✅ Camera ready: {actual_width}x{actual_height} (reduced for performance)")
         else:
             print("   ❌ No camera available!")
             exit(1)
@@ -86,6 +87,7 @@ class GreenPixelTracker:
         self.ble_client = None
         self.ble_connected = False
         self.running = True
+        self.last_data_received = 0  # Track when we last got data
         
         # Start BLE in background thread
         print("\n🚀 Starting BLE connection thread...")
@@ -127,12 +129,12 @@ class GreenPixelTracker:
             print("🔍 SCANNING FOR BLUETOOTH DEVICES")
             print("="*60)
             print("   Looking for: 'ForceStylus'")
-            print("   Timeout: 10 seconds")
+            print("   Timeout: 2 seconds")
             print("   Make sure your ESP32 is powered on!\n")
             
             try:
-                # Scan for devices
-                devices = await BleakScanner.discover(timeout=10.0)
+                # Scan for devices - FAST 2 second scan
+                devices = await BleakScanner.discover(timeout=2.0)
                 
                 print(f"📱 Found {len(devices)} Bluetooth device(s):\n")
                 
@@ -157,8 +159,8 @@ class GreenPixelTracker:
                 
                 if not esp32_device:
                     print("❌ ForceStylus not found!")
-                    print("\n   ⏳ Will retry in 5 seconds...\n")
-                    await asyncio.sleep(5)
+                    print("\n   ⏳ Will retry in 2 seconds...\n")
+                    await asyncio.sleep(2)
                     continue  # Try scanning again
                 
                 print("─"*60)
@@ -197,8 +199,18 @@ class GreenPixelTracker:
                     
                     # Keep connection alive and show live data
                     last_value_print = 0
+                    last_data_time = asyncio.get_event_loop().time()
+                    
                     try:
                         while self.running and client.is_connected:
+                            current_time = asyncio.get_event_loop().time()
+                            
+                            # Check if we're still receiving data
+                            if current_time - last_data_time > 1.0:
+                                # No data for 1 second - might be issue
+                                print(f"\n⚠️  No data received for 1 second...")
+                                last_data_time = current_time  # Reset to avoid spam
+                            
                             # Print force value when it changes
                             if self.force_value != last_value_print:
                                 if self.force_value > 20 or last_value_print > 20:
@@ -212,8 +224,9 @@ class GreenPixelTracker:
                                     
                                     print(f"   Force: {self.force_value:4d} ({newtons:.3f}N) │{bar:40s}│ {status} (thick={thickness})", end='\r')
                                     last_value_print = self.force_value
+                                    last_data_time = current_time
                             
-                            await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.02)  # 50Hz - faster updates!
                     
                     except Exception as e:
                         print(f"\n⚠️  Connection lost: {e}")
@@ -235,18 +248,20 @@ class GreenPixelTracker:
                 print("\n✋ BLE connection closed")
                 
                 if self.running:
-                    print("\n🔄 Attempting to reconnect in 3 seconds...")
-                    await asyncio.sleep(3)
+                    print("\n🔄 Attempting to reconnect in 1 second...")
+                    await asyncio.sleep(1)
                     # Loop will retry connection
                 else:
                     break  # User quit, exit loop
 
     def notification_handler(self, sender, data):
         """Called whenever ESP32 sends new force data"""
+        import time
         # Convert 2-byte array back to integer
         # data[0] = low byte, data[1] = high byte
         if len(data) == 2:
             self.force_value = data[0] | (data[1] << 8)
+            self.last_data_received = time.time()
 
     # ----------------------------------------------------------------
     # Force Sensor Logic
@@ -386,17 +401,16 @@ class GreenPixelTracker:
         return position
 
     def detect_blue(self, frame):
-        """Detect blue LED"""
+        """Detect blue LED - OPTIMIZED for performance"""
         if frame.shape[-1] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
         
-        # Less aggressive morphology for LED (point source)
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # Simpler morphology for LED (faster)
+        kernel = np.ones((3, 3), np.uint8)  # Smaller kernel
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)  # Single pass
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -409,23 +423,34 @@ class GreenPixelTracker:
             self.position_history.clear()
             return None, mask
 
-        # Use bounding box center for LED position
-        x, y, w, h = cv2.boundingRect(largest)
-        cx = x + w // 2
-        cy = y + h // 2
+        # Use moments for faster centroid calculation
+        M = cv2.moments(largest)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            return (cx, cy), mask
         
-        return (cx, cy), mask
+        return None, mask
 
     # ----------------------------------------------------------------
     # Main Loop
     # ----------------------------------------------------------------
     
     def run(self):
+        # Reduce frame rate to give BLE more CPU time
+        frame_skip = 0
+        
         while True:
             ret, frame = self.camera.read()
             if not ret:
                 print("⚠️ Camera feed lost")
                 break
+            
+            # Skip every other frame to reduce load (30fps → 15fps)
+            frame_skip += 1
+            if frame_skip % 2 != 0:
+                cv2.waitKey(10)  # Still need to process events and give BLE time
+                continue
 
             # Detect fiducials and blue LED
             fiducials, frame_marked = self.detect_fiducials(frame)
@@ -515,8 +540,8 @@ class GreenPixelTracker:
             cv2.imshow("Phone Camera View", frame_marked)
             cv2.imshow("Drawing Canvas (Project This)", canvas_display)
 
-            # Keyboard controls
-            key = cv2.waitKey(1) & 0xFF
+            # Longer waitKey = more time for BLE async thread (CRITICAL!)
+            key = cv2.waitKey(10) & 0xFF  # 10ms wait instead of 1ms
             if key == ord('q'):
                 break
             elif key == ord('c'):
