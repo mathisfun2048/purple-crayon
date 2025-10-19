@@ -4,6 +4,7 @@ from collections import deque
 import asyncio
 from bleak import BleakClient, BleakScanner
 import threading
+import time
 
 # BLE UUIDs - MUST match the ESP32 code
 SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -14,12 +15,24 @@ class GreenPixelTracker:
         print("\n" + "="*60)
         print("🎨 PRESSURE-SENSITIVE DRAWING SYSTEM")
         print("="*60)
-        
-        # --- Camera Setup ---
+
+        # ---------- Performance knobs (PC-side) ----------
+        self.proc_fps = 20           # Vision processing rate (Hz)
+        self.ui_fps = 30             # UI refresh rate (Hz)
+        self.proc_period_ms = int(1000 / self.proc_fps)
+        self.ui_period_ms = int(1000 / self.ui_fps)
+        self.last_proc_ms = 0
+        self.last_ui_ms = 0
+
+        # LED ROI search window (pixels). Smaller → faster, but be sure it's big enough.
+        self.roi_half = 80           # half-size of ROI box around last LED position
+        self.roi_downscale = 1.0     # 0.5 to speed up more (coords are scaled back)
+
+        # ---------- Camera Setup ----------
         camera_index = 1
         print(f"\n📷 Initializing camera...")
         print(f"   Trying camera index {camera_index} (iPhone/External)...")
-        
+
         self.camera = cv2.VideoCapture(camera_index)
         if not self.camera.isOpened():
             print(f"   ⚠️  Camera {camera_index} not available")
@@ -30,6 +43,19 @@ class GreenPixelTracker:
             # Reduce resolution for better performance
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Drop buffering so we don't build a backlog
+            try:
+                self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            # OpenCV perf flags: fewer threads = less CPU jitter, keep optimizations on
+            try:
+                cv2.setUseOptimized(True)
+                cv2.setNumThreads(2)   # adjust 1–4 depending on your CPU
+            except Exception:
+                pass
+
             actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
             print(f"   ✅ Camera ready: {actual_width}x{actual_height} (reduced for performance)")
@@ -37,7 +63,7 @@ class GreenPixelTracker:
             print("   ❌ No camera available!")
             exit(1)
 
-        # --- ArUco Setup ---
+        # ---------- ArUco Setup ----------
         print("\n🎯 Setting up ArUco marker detection...")
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -45,51 +71,52 @@ class GreenPixelTracker:
         self.transform_matrix = None
         self.marker_size = 200
         self.margin = 40
+        self.awaiting_calibration = False  # only detect markers when True
         print("   ✅ ArUco detector initialized")
         print("   Looking for markers: 0, 1, 2, 3")
 
-        # --- Canvas Setup ---
+        # ---------- Canvas Setup ----------
         print("\n🖼️  Creating canvas...")
         self.canvas_size = (720, 1280)
         self.canvas = self._make_fiducial_canvas()
-        self.calibration_canvas = self.canvas.copy()  # Keep calibration version
+        self.calibration_canvas = self.canvas.copy()
         self.is_calibrated = False
         self.last_draw_point = None
         print(f"   ✅ Canvas created: {self.canvas_size[1]}x{self.canvas_size[0]}")
         print("   ArUco markers placed at corners")
 
-        # --- Smoothing ---
+        # ---------- Smoothing ----------
         self.position_history = deque(maxlen=5)
-        
-        # --- Color Detection (Blue LED) ---
+        self.last_blue_pos_raw = None  # for ROI seeding
+
+        # ---------- Color Detection (Blue LED) ----------
         print("\n🔵 Configuring blue LED tracking...")
-        # Blue LED HSV range - adjust these if needed
         self.blue_lower = np.array([100, 150, 50])   # Lower bound: Hue, Saturation, Value
         self.blue_upper = np.array([130, 255, 255])  # Upper bound
-        self.min_area = 50  # Smaller area for LED (LEDs are point sources)
+        self.min_area = 50
         print("   ✅ HSV range configured for blue LED")
         print(f"   Hue: 100-130, Saturation: 150-255, Value: 50-255")
         print(f"   Minimum detection area: {self.min_area} pixels")
 
-        # --- Force Sensor Setup (SingleTact 1N - Correct Protocol) ---
+        # ---------- Force Sensor Setup ----------
         print("\n⚡ Force sensor configuration...")
         self.force_value = 0
-        self.force_threshold = 614  # 0.6 N threshold (614/1024 * 1.0 = 0.6N)
+        self.force_threshold = 614  # ~0.6 N
         self.min_thickness = 1
         self.max_thickness = 15
-        self.force_max = 1024  # SingleTact 1N raw range (0-1024)
-        self.sensor_max_newtons = 1.0  # 1 Newton max
+        self.force_max = 1024
+        self.sensor_max_newtons = 1.0
         print(f"   Initial threshold: {self.force_threshold} ADC (~{self.to_newtons(self.force_threshold):.3f}N)")
         print(f"   Line thickness range: {self.min_thickness}-{self.max_thickness} pixels")
         print(f"   Max sensor value: {self.force_max} (~{self.sensor_max_newtons}N)")
-        
-        # BLE connection
+
+        # ---------- BLE ----------
         self.ble_client = None
         self.ble_connected = False
         self.running = True
-        self.last_data_received = 0  # Track when we last got data
-        
-        # Start BLE in background thread
+        self.last_data_received = 0
+        self.device_address = None   # cache address to skip scans next time
+
         print("\n🚀 Starting BLE connection thread...")
         self.ble_thread = threading.Thread(target=self.run_ble_loop, daemon=True)
         self.ble_thread.start()
@@ -113,152 +140,110 @@ class GreenPixelTracker:
     # ----------------------------------------------------------------
     # BLE Functions
     # ----------------------------------------------------------------
-    
     def run_ble_loop(self):
-        """Run BLE operations in separate thread with its own event loop"""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self.connect_ble())
         loop.close()
 
+    async def fast_find_device(self, name_substring="ForceStylus", timeout=0.4):
+        """
+        Try to find quickly by name; returns device or None.
+        Uses find_device_by_filter when available; falls back to discover.
+        """
+        try:
+            # Newer Bleak has this utility; quicker than full discovery on some OSes
+            device = await BleakScanner.find_device_by_filter(
+                lambda d, ad: (d.name and name_substring in d.name), timeout=timeout
+            )
+            return device
+        except Exception:
+            # Fallback: short discovery
+            devices = await BleakScanner.discover(timeout=timeout)
+            for d in devices:
+                if d.name and name_substring in d.name:
+                    return d
+            return None
+
+    def _on_disconnect(self, client):
+        # Called from Bleak transport thread
+        print("\n🔌 BLE disconnected (callback).")
+        self.ble_connected = False
+
     async def connect_ble(self):
-        """Find and connect to the ESP32 via BLE with auto-reconnect"""
-        
-        while self.running:  # Auto-reconnect loop
+        """Find and connect to the ESP32 via BLE with fast auto-reconnect"""
+        backoff = 0.3  # very quick retry
+
+        while self.running:
             print("\n" + "="*60)
-            print("🔍 SCANNING FOR BLUETOOTH DEVICES")
+            print("🔍 SCANNING/CONNECTING BLUETOOTH")
             print("="*60)
-            print("   Looking for: 'ForceStylus'")
-            print("   Timeout: 2 seconds")
-            print("   Make sure your ESP32 is powered on!\n")
-            
+
             try:
-                # Scan for devices - FAST 2 second scan
-                devices = await BleakScanner.discover(timeout=2.0)
-                
-                print(f"📱 Found {len(devices)} Bluetooth device(s):\n")
-                
-                esp32_device = None
-                for i, device in enumerate(devices, 1):
-                    device_name = device.name or "Unknown"
-                    
-                    # Highlight our device
-                    if "Force" in device_name or device_name == "ForceStylus":
-                        print(f"   {i}. ✅ {device_name:25s} ({device.address})")
-                        print(f"      ↑↑↑ THIS IS YOUR FORCE STYLUS! ↑↑↑")
-                        # Try to get RSSI if available
-                        try:
-                            print(f"      Signal: {device.rssi} dBm")
-                        except AttributeError:
-                            pass  # RSSI not available on this platform
-                        esp32_device = device
-                    else:
-                        print(f"   {i}. {device_name:25s} ({device.address})")
-                
-                print()
-                
-                if not esp32_device:
-                    print("❌ ForceStylus not found!")
-                    print("\n   ⏳ Will retry in 2 seconds...\n")
-                    await asyncio.sleep(2)
-                    continue  # Try scanning again
-                
-                print("─"*60)
-                print(f"✅ Found ForceStylus!")
-                print(f"   Address: {esp32_device.address}")
-                print("─"*60)
-                print("\n🔗 Connecting to device...")
-                
-                # Connect to the device
-                async with BleakClient(esp32_device.address) as client:
+                device = None
+                if self.device_address:
+                    # Skip scan: connect directly to cached address
+                    print(f"   Using cached address: {self.device_address}")
+                    device = type("Tmp", (), {"address": self.device_address})()
+                else:
+                    print("   Fast find 'ForceStylus'… (≤0.4s)")
+                    device = await self.fast_find_device("ForceStylus", timeout=0.4)
+
+                if not device:
+                    print("   ❌ Not found. Quick retry…")
+                    await asyncio.sleep(backoff)
+                    continue
+
+                address = device.address if hasattr(device, "address") else device
+                print(f"\n🔗 Connecting to {address} …")
+                async with BleakClient(address, disconnected_callback=self._on_disconnect, timeout=5.0) as client:
                     self.ble_client = client
                     self.ble_connected = True
-                    
+                    if not self.device_address:
+                        # Cache for future ultra-fast reconnects
+                        self.device_address = address
+
                     print("✅ Connected successfully!")
-                    
-                    # Find our service
-                    service_found = False
-                    for service in client.services:
-                        if service.uuid.lower() == SERVICE_UUID.lower():
-                            service_found = True
-                            print(f"   ✓ Force sensor service found")
-                            break
-                    
-                    if not service_found:
-                        print("   ⚠️  Expected service not found")
-                    
-                    print("\n📡 Subscribing to force sensor notifications...")
-                    
-                    # Subscribe to notifications
+                    print("📡 Subscribing to force sensor notifications…")
                     await client.start_notify(CHARACTERISTIC_UUID, self.notification_handler)
-                    
                     print("✅ Receiving force data from ESP32!")
-                    print("─"*60)
-                    print("\n💡 Press the sensor to see values update")
-                    print("   Drawing will start when force > threshold\n")
-                    
-                    # Keep connection alive and show live data
-                    last_value_print = 0
-                    last_data_time = asyncio.get_event_loop().time()
-                    
-                    try:
-                        while self.running and client.is_connected:
-                            current_time = asyncio.get_event_loop().time()
-                            
-                            # Check if we're still receiving data
-                            if current_time - last_data_time > 1.0:
-                                # No data for 1 second - might be issue
-                                print(f"\n⚠️  No data received for 1 second...")
-                                last_data_time = current_time  # Reset to avoid spam
-                            
-                            # Print force value when it changes
-                            if self.force_value != last_value_print:
-                                if self.force_value > 20 or last_value_print > 20:
-                                    newtons = self.to_newtons(self.force_value)
-                                    bar_length = min(40, (self.force_value * 40) // self.force_max)
-                                    bar = "█" * bar_length
-                                    
-                                    # Show if drawing is active
-                                    status = "DRAWING" if self.is_drawing_enabled() else "standby"
-                                    thickness = self.get_line_thickness()
-                                    
-                                    print(f"   Force: {self.force_value:4d} ({newtons:.3f}N) │{bar:40s}│ {status} (thick={thickness})", end='\r')
-                                    last_value_print = self.force_value
-                                    last_data_time = current_time
-                            
-                            await asyncio.sleep(0.02)  # 50Hz - faster updates!
-                    
-                    except Exception as e:
-                        print(f"\n⚠️  Connection lost: {e}")
-                    
-                    # Graceful cleanup
-                    print("\n\n🔌 Cleaning up connection...")
+
+                    # Lightweight keep-alive / progress
+                    last_value_print = -1
+                    last_data_time = time.monotonic()
+
+                    while self.running and client.is_connected:
+                        # Watchdog for data
+                        if (time.monotonic() - last_data_time) > 2.0:
+                            print("\n⚠️  No data in 2s (still connected)…")
+                            last_data_time = time.monotonic()
+
+                        if self.force_value != last_value_print:
+                            # Do not spam; only print when visible change
+                            last_value_print = self.force_value
+                            last_data_time = time.monotonic()
+
+                        await asyncio.sleep(0.02)  # 50 Hz cooperative yield
+
+                    # Clean up
                     try:
                         if client.is_connected:
                             await client.stop_notify(CHARACTERISTIC_UUID)
                     except Exception:
-                        pass  # Ignore cleanup errors
-                        
+                        pass
+
             except Exception as e:
                 print(f"\n❌ BLE Error: {e}")
-                print("   Connection lost or failed")
-            
+
             finally:
                 self.ble_connected = False
-                print("\n✋ BLE connection closed")
-                
+                print("✋ BLE connection closed")
                 if self.running:
-                    print("\n🔄 Attempting to reconnect in 1 second...")
-                    await asyncio.sleep(1)
-                    # Loop will retry connection
-                else:
-                    break  # User quit, exit loop
+                    print(f"🔄 Reconnect in {backoff:.1f}s…")
+                    await asyncio.sleep(backoff)
 
     def notification_handler(self, sender, data):
-        """Called whenever ESP32 sends new force data"""
-        import time
-        # Convert 2-byte array back to integer
-        # data[0] = low byte, data[1] = high byte
+        """Called whenever ESP32 sends new force data (2 bytes: LSB, MSB)"""
         if len(data) == 2:
             self.force_value = data[0] | (data[1] << 8)
             self.last_data_received = time.time()
@@ -266,118 +251,85 @@ class GreenPixelTracker:
     # ----------------------------------------------------------------
     # Force Sensor Logic
     # ----------------------------------------------------------------
-    
     def get_line_thickness(self):
-        """Calculate line thickness based on force"""
         if self.force_value < self.force_threshold:
-            return 0  # No drawing below threshold
-        
+            return 0
         force_range = self.force_max - self.force_threshold
         thickness_range = self.max_thickness - self.min_thickness
-        
-        force_above_threshold = self.force_value - self.force_threshold
-        thickness = self.min_thickness + (force_above_threshold / force_range) * thickness_range
-        
+        force_above = max(0, self.force_value - self.force_threshold)
+        thickness = self.min_thickness + (force_above / max(1, force_range)) * thickness_range
         return int(max(self.min_thickness, min(self.max_thickness, thickness)))
 
     def is_drawing_enabled(self):
-        """Check if force is above threshold"""
         return self.force_value >= self.force_threshold
-    
+
     def to_newtons(self, adc_value):
-        """Convert ADC value to Newtons"""
         return (adc_value / self.force_max) * self.sensor_max_newtons
 
     # ----------------------------------------------------------------
-    # Canvas and Vision Functions
+    # Canvas and Vision
     # ----------------------------------------------------------------
-    
     def _make_fiducial_canvas(self):
-        """Create canvas with ArUco markers for calibration"""
         canvas = np.ones((self.canvas_size[0], self.canvas_size[1], 3), dtype=np.uint8) * 230
         aruco_dict = self.aruco_dict
-
         corners = [
             (self.margin, self.margin),
             (self.canvas_size[1] - self.marker_size - self.margin, self.margin),
             (self.canvas_size[1] - self.marker_size - self.margin, self.canvas_size[0] - self.marker_size - self.margin),
             (self.margin, self.canvas_size[0] - self.marker_size - self.margin)
         ]
-
         for i, (x, y) in enumerate(corners):
             marker = cv2.aruco.generateImageMarker(aruco_dict, i, self.marker_size)
             marker_bgr = cv2.cvtColor(marker, cv2.COLOR_GRAY2BGR)
             canvas[y:y+self.marker_size, x:x+self.marker_size] = marker_bgr
-
         return canvas
-    
+
     def _make_clean_canvas(self):
-        """Create clean black canvas for drawing"""
         return np.zeros((self.canvas_size[0], self.canvas_size[1], 3), dtype=np.uint8)
 
     def detect_fiducials(self, frame):
-        """Detect ArUco markers"""
+        """Detect ArUco markers (only called in calibration mode)"""
         if frame.shape[-1] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self.aruco_detector.detectMarkers(gray)
-
         frame_marked = frame.copy()
-        
+
         if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(frame_marked, corners, ids)
             ids_list = ids.flatten().tolist()
-            
             cv2.putText(frame_marked, f"Detected IDs: {ids_list}", (30, 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             if all(fid in ids_list for fid in [0, 1, 2, 3]):
                 centers = {}
                 for i, fid in enumerate(ids.flatten()):
                     if fid in [0, 1, 2, 3]:
                         c = corners[i][0].mean(axis=0)
                         centers[fid] = c
-                
                 if len(centers) == 4:
-                    src_pts = np.float32([
-                        centers[0],
-                        centers[1],
-                        centers[2],
-                        centers[3]
-                    ])
+                    src_pts = np.float32([centers[0], centers[1], centers[2], centers[3]])
                     return src_pts, frame_marked
         else:
             cv2.putText(frame_marked, "No markers detected", (30, 80),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         return None, frame_marked
 
     def setup_transform(self, src_points):
-        """Setup perspective transform and switch to clean canvas"""
         w, h = self.canvas_size[1], self.canvas_size[0]
         marker_center_offset = self.marker_size // 2
-        
         dst_points = np.float32([
             [self.margin + marker_center_offset, self.margin + marker_center_offset],
             [w - self.margin - marker_center_offset, self.margin + marker_center_offset],
             [w - self.margin - marker_center_offset, h - self.margin - marker_center_offset],
             [self.margin + marker_center_offset, h - self.margin - marker_center_offset]
         ])
-        
         self.transform_matrix = cv2.getPerspectiveTransform(src_points, dst_points)
         self.is_calibrated = True
-        
-        # Switch to clean black canvas after calibration
+        self.awaiting_calibration = False
         self.canvas = self._make_clean_canvas()
-        
         print("\n" + "="*60)
         print("✅ CALIBRATION SUCCESSFUL!")
         print("="*60)
-        print("   Camera view is now mapped to canvas")
-        print("   Switched to clean black canvas")
-        print("   You can now draw with white lines!")
-        print("="*60 + "\n")
 
     def transform_point(self, point):
         if self.transform_matrix is None:
@@ -387,33 +339,52 @@ class GreenPixelTracker:
         return tuple(transformed[0][0].astype(int))
 
     def smooth_position(self, position):
-        """Apply smoothing to reduce jitter"""
         if position is None:
             return None
-        
         self.position_history.append(position)
-        
         if len(self.position_history) > 0:
             avg_x = int(np.mean([p[0] for p in self.position_history]))
             avg_y = int(np.mean([p[1] for p in self.position_history]))
             return (avg_x, avg_y)
-        
         return position
 
     def detect_blue(self, frame):
-        """Detect blue LED - OPTIMIZED for performance"""
+        """
+        Detect blue LED with ROI acceleration:
+        - If we have a last position, search a small box around it.
+        - Optional downscale inside ROI to reduce work even more.
+        """
         if frame.shape[-1] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
-        
-        # Simpler morphology for LED (faster)
-        kernel = np.ones((3, 3), np.uint8)  # Smaller kernel
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)  # Single pass
-        
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        H, W = frame.shape[:2]
+        # Choose ROI
+        if self.last_blue_pos_raw is not None:
+            cx, cy = self.last_blue_pos_raw
+            x0 = max(0, cx - self.roi_half)
+            y0 = max(0, cy - self.roi_half)
+            x1 = min(W, cx + self.roi_half)
+            y1 = min(H, cy + self.roi_half)
+            roi = frame[y0:y1, x0:x1]
+            offset = (x0, y0)
+        else:
+            roi = frame
+            offset = (0, 0)
+
+        # Optional downscale inside ROI
+        if self.roi_downscale != 1.0:
+            roi_small = cv2.resize(roi, None, fx=self.roi_downscale, fy=self.roi_downscale, interpolation=cv2.INTER_LINEAR)
+        else:
+            roi_small = roi
+
+        hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
+
+        # Simple morphology
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             self.position_history.clear()
             return None, mask
@@ -423,160 +394,167 @@ class GreenPixelTracker:
             self.position_history.clear()
             return None, mask
 
-        # Use moments for faster centroid calculation
         M = cv2.moments(largest)
-        if M["m00"] > 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            return (cx, cy), mask
-        
-        return None, mask
+        if M["m00"] <= 0:
+            return None, mask
+
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+
+        # Scale back if we downscaled ROI
+        if self.roi_downscale != 1.0:
+            cx = int(cx / self.roi_downscale)
+            cy = int(cy / self.roi_downscale)
+
+        # Convert to full-frame coordinates
+        cx += offset[0]
+        cy += offset[1]
+
+        # Update last raw pos for next ROI
+        self.last_blue_pos_raw = (cx, cy)
+        return (cx, cy), mask
 
     # ----------------------------------------------------------------
     # Main Loop
     # ----------------------------------------------------------------
-    
     def run(self):
-        # Reduce frame rate to give BLE more CPU time
-        frame_skip = 0
-        
+        last_frame_marked = None
+        last_canvas_display = None
+
         while True:
             ret, frame = self.camera.read()
             if not ret:
                 print("⚠️ Camera feed lost")
                 break
-            
-            # Skip every other frame to reduce load (30fps → 15fps)
-            frame_skip += 1
-            if frame_skip % 2 != 0:
-                cv2.waitKey(10)  # Still need to process events and give BLE time
-                continue
 
-            # Detect fiducials and blue LED
-            fiducials, frame_marked = self.detect_fiducials(frame)
-            blue_pos, mask = self.detect_blue(frame)
-            blue_pos_smoothed = self.smooth_position(blue_pos)
+            now_ms = int(time.time() * 1000)
 
-            # Get drawing parameters from force sensor
-            drawing_enabled = self.is_drawing_enabled()
-            line_thickness = self.get_line_thickness()
+            # --- PROCESSING: only at proc_fps ---
+            if now_ms - self.last_proc_ms >= self.proc_period_ms:
+                self.last_proc_ms = now_ms
 
-            # Draw blue LED detection
-            if blue_pos_smoothed is not None:
-                # Show blue circle on camera view
-                cv2.circle(frame_marked, blue_pos_smoothed, 10, (255, 0, 0), 2)  # Blue circle
-                cv2.circle(frame_marked, blue_pos_smoothed, 3, (255, 0, 0), -1)
-                
-                if self.transform_matrix is not None:
+                # Only run ArUco detection when calibrating or not calibrated
+                if (not self.is_calibrated) or self.awaiting_calibration:
+                    fiducials, frame_marked = self.detect_fiducials(frame)
+                else:
+                    fiducials = None
+                    frame_marked = frame.copy()
+
+                # LED detection (fast, uses ROI)
+                blue_pos, _ = self.detect_blue(frame)
+                blue_pos_smoothed = self.smooth_position(blue_pos)
+
+                # Get drawing parameters from force sensor
+                drawing_enabled = self.is_drawing_enabled()
+                line_thickness = self.get_line_thickness()
+
+                # Draw blue LED cursor on camera view
+                if blue_pos_smoothed is not None:
+                    cv2.circle(frame_marked, blue_pos_smoothed, 10, (255, 0, 0), 2)
+                    cv2.circle(frame_marked, blue_pos_smoothed, 3, (255, 0, 0), -1)
+
+                    if self.transform_matrix is not None:
+                        draw_pos = self.transform_point(blue_pos_smoothed)
+                        draw_pos = (
+                            max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
+                            max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
+                        )
+                        if drawing_enabled and line_thickness > 0:
+                            if self.last_draw_point is not None:
+                                cv2.line(self.canvas, self.last_draw_point, draw_pos,
+                                         (255, 255, 255), line_thickness)
+                            self.last_draw_point = draw_pos
+                        else:
+                            self.last_draw_point = None
+                else:
+                    self.last_draw_point = None
+                    self.position_history.clear()
+
+                # Status overlays
+                if self.is_calibrated:
+                    calibrated_text = "CALIBRATED - BLACK CANVAS MODE"
+                    calibrated_color = (0, 255, 0)
+                else:
+                    calibrated_text = "NOT CALIBRATED (press 'c' to calibrate)"
+                    calibrated_color = (0, 0, 255)
+                cv2.putText(frame_marked, calibrated_text, (30, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, calibrated_color, 2)
+
+                ble_status = "CONNECTED" if self.ble_connected else "DISCONNECTED"
+                ble_color = (0, 255, 0) if self.ble_connected else (0, 0, 255)
+                cv2.putText(frame_marked, f"BLE: {ble_status}", (30, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, ble_color, 2)
+
+                force_newtons = self.to_newtons(self.force_value)
+                threshold_n = self.to_newtons(self.force_threshold)
+                force_text = f"Force: {self.force_value} ({force_newtons:.3f}N) | Threshold: {self.force_threshold} ({threshold_n:.3f}N)"
+                cv2.putText(frame_marked, force_text, (30, 200),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+
+                drawing_text = f"DRAWING: {'ON' if drawing_enabled else 'OFF'} (Thickness: {line_thickness}px)"
+                drawing_color = (0, 255, 255) if drawing_enabled else (128, 128, 128)
+                cv2.putText(frame_marked, drawing_text, (30, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, drawing_color, 2)
+
+                # Compose canvas display with cursor
+                canvas_display = self.canvas.copy()
+                if blue_pos_smoothed is not None and self.transform_matrix is not None:
                     draw_pos = self.transform_point(blue_pos_smoothed)
                     draw_pos = (
                         max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
                         max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
                     )
-                    
-                    # DRAW ONLY IF FORCE IS ABOVE THRESHOLD
-                    if drawing_enabled and line_thickness > 0:
-                        if self.last_draw_point is not None:
-                            # Draw line in WHITE with variable thickness based on pressure
-                            cv2.line(self.canvas, self.last_draw_point, draw_pos, 
-                                   (255, 255, 255), line_thickness)
-                        self.last_draw_point = draw_pos
-                    else:
-                        # Not pressing hard enough - don't draw
-                        self.last_draw_point = None
-            else:
-                self.last_draw_point = None
-                self.position_history.clear()
+                    cursor_radius = max(5, line_thickness + 2)
+                    cursor_color = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
+                    if not drawing_enabled:
+                        cursor_color = (128, 128, 128)
+                    cv2.circle(canvas_display, draw_pos, cursor_radius, cursor_color, 2)
+                    cv2.circle(canvas_display, draw_pos, 3, cursor_color, -1)
 
-            # Status display
-            if self.is_calibrated:
-                calibrated_text = "CALIBRATED - BLACK CANVAS MODE"
-                calibrated_color = (0, 255, 0)
-            else:
-                calibrated_text = "NOT CALIBRATED (press 'c' to calibrate)"
-                calibrated_color = (0, 0, 255)
-            
-            cv2.putText(frame_marked, calibrated_text, (30, 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, calibrated_color, 2)
-            
-            # BLE connection status
-            ble_status = "CONNECTED" if self.ble_connected else "DISCONNECTED"
-            ble_color = (0, 255, 0) if self.ble_connected else (0, 0, 255)
-            cv2.putText(frame_marked, f"BLE: {ble_status}", (30, 160),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, ble_color, 2)
-            
-            # Force sensor status with Newtons
-            force_newtons = self.to_newtons(self.force_value)
-            threshold_n = self.to_newtons(self.force_threshold)
-            force_text = f"Force: {self.force_value} ({force_newtons:.3f}N) | Threshold: {self.force_threshold} ({threshold_n:.3f}N)"
-            cv2.putText(frame_marked, force_text, (30, 200),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
-            
-            drawing_text = f"DRAWING: {'ON' if drawing_enabled else 'OFF'} (Thickness: {line_thickness}px)"
-            drawing_color = (0, 255, 255) if drawing_enabled else (128, 128, 128)
-            cv2.putText(frame_marked, drawing_text, (30, 240),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, drawing_color, 2)
+                last_frame_marked = frame_marked
+                last_canvas_display = canvas_display
 
-            # Canvas display with cursor
-            canvas_display = self.canvas.copy()
+                # Handle calibration trigger (only after processing step)
+                if self.awaiting_calibration and fiducials is not None:
+                    self.setup_transform(fiducials)
 
-            if blue_pos_smoothed is not None and self.transform_matrix is not None:
-                draw_pos = self.transform_point(blue_pos_smoothed)
-                draw_pos = (
-                    max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
-                    max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
-                )
-                
-                # Cursor size reflects line thickness
-                cursor_radius = max(5, line_thickness + 2)
-                # White cursor on black background when calibrated, colored on gray when not
-                if self.is_calibrated:
-                    cursor_color = (255, 255, 255) if drawing_enabled else (128, 128, 128)
-                else:
-                    cursor_color = (0, 0, 255) if drawing_enabled else (0, 165, 255)
-                cv2.circle(canvas_display, draw_pos, cursor_radius, cursor_color, 2)
-                cv2.circle(canvas_display, draw_pos, 3, cursor_color, -1)
+            # --- UI: only refresh at ui_fps ---
+            if last_frame_marked is not None and (now_ms - self.last_ui_ms >= self.ui_period_ms):
+                self.last_ui_ms = now_ms
+                cv2.imshow("Phone Camera View", last_frame_marked)
+                if last_canvas_display is not None:
+                    cv2.imshow("Drawing Canvas (Project This)", last_canvas_display)
 
-            cv2.imshow("Phone Camera View", frame_marked)
-            cv2.imshow("Drawing Canvas (Project This)", canvas_display)
-
-            # Longer waitKey = more time for BLE async thread (CRITICAL!)
-            key = cv2.waitKey(10) & 0xFF  # 10ms wait instead of 1ms
+            key = cv2.waitKey(1) & 0xFF  # small wait; we're pacing via fps gates
             if key == ord('q'):
                 break
             elif key == ord('c'):
-                if fiducials is not None:
-                    self.setup_transform(fiducials)
-                else:
-                    print("❌ Cannot calibrate - markers not visible")
-                    print("   → Make sure all 4 ArUco markers are visible in camera")
-                    if self.is_calibrated:
-                        print("   💡 To recalibrate: press 'r' to show markers, then 'c'")
+                # Enter calibration mode: show markers and start detecting
+                self.awaiting_calibration = True
+                self.is_calibrated = False
+                self.canvas = self._make_fiducial_canvas()
+                print("📐 Calibration mode: show all 4 ArUco markers, then press 'c' again if needed.")
             elif key == ord('r'):
-                # Reset canvas based on calibration state
                 if self.is_calibrated:
-                    # Stay in drawing mode with clean black canvas
                     self.canvas = self._make_clean_canvas()
                     print("🎨 Drawing reset (clean black canvas)")
                 else:
-                    # Reset to calibration mode with markers
                     self.canvas = self._make_fiducial_canvas()
                     print("🎨 Canvas reset (showing calibration markers)")
                 self.last_draw_point = None
             elif key == ord('+') or key == ord('='):
                 self.force_threshold += 25
                 threshold_n = self.to_newtons(self.force_threshold)
-                print(f"⬆️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N) - harder press needed")
+                print(f"⬆️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N)")
             elif key == ord('-') or key == ord('_'):
                 self.force_threshold = max(0, self.force_threshold - 25)
                 threshold_n = self.to_newtons(self.force_threshold)
-                print(f"⬇️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N) - easier to draw")
+                print(f"⬇️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N)")
 
         # Cleanup
         self.running = False
         self.camera.release()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     tracker = GreenPixelTracker()
