@@ -16,9 +16,10 @@ class GreenPixelTracker:
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         print("✅ Camera ready.")
 
-        # --- ArUco Setup ---
+        # --- ArUco Setup (Updated for OpenCV 4.7+) ---
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         self.transform_matrix = None
         self.marker_size = 200
         self.margin = 40
@@ -62,12 +63,12 @@ class GreenPixelTracker:
 
     # ----------------------------------------------------------------
     def detect_fiducials(self, frame):
-        """Detect ArUco markers"""
+        """Detect ArUco markers (Updated for OpenCV 4.7+)"""
         if frame.shape[-1] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
         frame_marked = frame.copy()
         
@@ -177,7 +178,7 @@ class GreenPixelTracker:
         while True:
             ret, frame = self.camera.read()
             if not ret:
-                print("⚠️ Camera feed lost — check your phone connection.")
+                print("⚠️ Camera feed lost — check your camera permissions in System Settings.")
                 break
 
             # Detect fiducials first
