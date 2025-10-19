@@ -13,20 +13,28 @@ CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 class GreenPixelTracker:
     def __init__(self):
         print("\n" + "="*60)
-        print("🎨 PRESSURE-SENSITIVE DRAWING SYSTEM")
+        print("🎨 PRESSURE-SENSITIVE DRAWING SYSTEM (FAST)")
         print("="*60)
 
         # ---------- Performance knobs (PC-side) ----------
-        self.proc_fps = 20           # Vision processing rate (Hz)
-        self.ui_fps = 30             # UI refresh rate (Hz)
+        self.proc_fps = 15            # Vision processing rate (Hz)  ← lower for less CPU
+        self.ui_fps   = 24            # UI refresh rate (Hz)
         self.proc_period_ms = int(1000 / self.proc_fps)
-        self.ui_period_ms = int(1000 / self.ui_fps)
+        self.ui_period_ms   = int(1000 / self.ui_fps)
         self.last_proc_ms = 0
-        self.last_ui_ms = 0
+        self.last_ui_ms   = 0
 
-        # LED ROI search window (pixels). Smaller → faster, but be sure it's big enough.
-        self.roi_half = 80           # half-size of ROI box around last LED position
-        self.roi_downscale = 1.0     # 0.5 to speed up more (coords are scaled back)
+        # LED ROI search window (pixels). Small = faster. Expands if target lost.
+        self.roi_half_base = 60       # base half-size of ROI box
+        self.roi_half      = self.roi_half_base
+        self.roi_downscale = 1.0      # 0.5 to speed up more (coords are scaled back)
+        self.max_fullframe_checks = 10  # INCREASED: full-frame searches per second when lost
+
+        # Top-K & bright-core gating to limit pixels used for centroid
+        self.TOP_K      = 200         # cap pixels used for centroid (fast & stable)
+        self.V_BRIGHT   = 100         # LOWERED: V-channel threshold (was 170, now more sensitive)
+        self.ERODE_ON   = True        # one erode to shrink bloom
+        self.ERODE_K    = np.ones((3,3), np.uint8)
 
         # ---------- Camera Setup ----------
         camera_index = 1
@@ -40,25 +48,22 @@ class GreenPixelTracker:
             self.camera = cv2.VideoCapture(0)
 
         if self.camera.isOpened():
-            # Reduce resolution for better performance
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            # Reduce resolution for better performance (320x240 if you want ultra-light)
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             # Drop buffering so we don't build a backlog
             try:
                 self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
                 pass
-
-            # OpenCV perf flags: fewer threads = less CPU jitter, keep optimizations on
             try:
                 cv2.setUseOptimized(True)
-                cv2.setNumThreads(2)   # adjust 1–4 depending on your CPU
+                cv2.setNumThreads(2)   # tune 1–4 depending on CPU
             except Exception:
                 pass
-
-            actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_width  = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
             actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"   ✅ Camera ready: {actual_width}x{actual_height} (reduced for performance)")
+            print(f"   ✅ Camera ready: {actual_width}x{actual_height} (performance mode)")
         else:
             print("   ❌ No camera available!")
             exit(1)
@@ -87,55 +92,126 @@ class GreenPixelTracker:
 
         # ---------- Smoothing ----------
         self.position_history = deque(maxlen=5)
-        self.last_blue_pos_raw = None  # for ROI seeding
+        self.last_green_pos_raw = None  # for ROI seeding
+        self.last_fullframe_check = 0.0
 
-        # ---------- Color Detection (Blue LED) ----------
-        print("\n🔵 Configuring blue LED tracking...")
-        self.blue_lower = np.array([55, 180, 140])   # Lower bound: Hue, Saturation, Value
-        self.blue_upper = np.array([80, 255, 255])  # Upper bound
-        self.min_area = 50
-        print("   ✅ HSV range configured for blue LED")
-        print(f"   Hue: 100-130, Saturation: 150-255, Value: 50-255")
-        print(f"   Minimum detection area: {self.min_area} pixels")
+        # ---------- Color Detection (Green LED) - FIXED! ----------
+        print("\n🟢 Configuring GREEN LED tracking (HSV)…")
+        # FIXED: Changed from [115-125] to [40-80] for proper green detection
+        self.green_lower = np.array([40, 50, 50])  # H,S,V - Wider green range
+        self.green_upper = np.array([80, 255, 255])
+        self.min_area = 20  # LEDs are point sources; keep small
+        print("   ✅ HSV range configured for green LED")
+        print("   ✅ IMPROVED: Using H=40-80 (proper green range)")
 
         # ---------- Force Sensor Setup ----------
         print("\n⚡ Force sensor configuration...")
         self.force_value = 0
-        self.force_threshold = 614  # ~0.6 N
+        
+        # AUTO-TUNING THRESHOLD SYSTEM
+        self.force_history = deque(maxlen=150)  # Track last ~10 seconds at 15fps
+        self.baseline_percentile = 30  # Use 30th percentile as baseline (robust to peaks)
+        self.sensitivity_margin = 80  # How much above baseline = drawing (adjustable with +/-)
+        self.force_threshold = 280  # Initial value, will auto-adjust
+        self.auto_tune_enabled = True  # Toggle with 'a' key
+        
         self.min_thickness = 1
         self.max_thickness = 15
         self.force_max = 1024
         self.sensor_max_newtons = 1.0
-        print(f"   Initial threshold: {self.force_threshold} ADC (~{self.to_newtons(self.force_threshold):.3f}N)")
-        print(f"   Line thickness range: {self.min_thickness}-{self.max_thickness} pixels")
-        print(f"   Max sensor value: {self.force_max} (~{self.sensor_max_newtons}N)")
+        print(f"   🤖 AUTO-TUNING ENABLED: Threshold adapts to sensor drift")
+        print(f"   Initial sensitivity margin: {self.sensitivity_margin} ADC above baseline (MORE SENSITIVE)")
 
         # ---------- BLE ----------
         self.ble_client = None
         self.ble_connected = False
         self.running = True
         self.last_data_received = 0
-        self.device_address = None   # cache address to skip scans next time
+        self.device_address = None   # cache address to skip scans
 
-        print("\n🚀 Starting BLE connection thread...")
+        print("\n🚀 Starting BLE connection thread…")
         self.ble_thread = threading.Thread(target=self.run_ble_loop, daemon=True)
         self.ble_thread.start()
 
         print("\n" + "="*60)
         print("✅ SYSTEM READY")
         print("="*60)
-        print("📋 Instructions:")
-        print("   1. Wait for BLE connection to 'ForceStylus'")
-        print("   2. Project 'Drawing Canvas' window full-screen")
-        print("   3. Press 'c' to calibrate (show all 4 markers)")
-        print("   4. Point blue LED at canvas and press force sensor to draw!")
-        print("\n⌨️  Keyboard Controls:")
-        print("   c  = Calibrate system (shows markers, then switches to black)")
-        print("   r  = Reset canvas")
-        print("   +  = Increase force threshold (harder press needed)")
-        print("   -  = Decrease force threshold (easier to draw)")
-        print("   q  = Quit")
+        print("⌨️  Keys: c=calibrate, r=reset canvas, +/-=sensitivity, q=quit")
+        print("⌨️  NEW: a=toggle auto-tune, t=test HSV tuner, m=toggle mask")
         print("="*60 + "\n")
+
+    # ----------------------------------------------------------------
+    # NEW: HSV Tuner for finding exact color values
+    # ----------------------------------------------------------------
+    def test_color_range(self):
+        """Interactive HSV tuner - adjust sliders to find your LED's exact color"""
+        print("\n" + "="*60)
+        print("🎨 HSV COLOR TUNER")
+        print("="*60)
+        print("Adjust sliders until your LED appears WHITE in the mask window")
+        print("Press 'p' to print current values")
+        print("Press 'q' to quit tuner")
+        print("="*60 + "\n")
+        
+        cv2.namedWindow("HSV Tuner - Mask")
+        cv2.namedWindow("HSV Tuner - Original")
+        
+        # Create sliders with current values as defaults
+        cv2.createTrackbar("H Low", "HSV Tuner - Mask", 40, 179, lambda x: None)
+        cv2.createTrackbar("H High", "HSV Tuner - Mask", 80, 179, lambda x: None)
+        cv2.createTrackbar("S Low", "HSV Tuner - Mask", 50, 255, lambda x: None)
+        cv2.createTrackbar("S High", "HSV Tuner - Mask", 255, 255, lambda x: None)
+        cv2.createTrackbar("V Low", "HSV Tuner - Mask", 50, 255, lambda x: None)
+        cv2.createTrackbar("V High", "HSV Tuner - Mask", 255, 255, lambda x: None)
+        
+        while True:
+            ret, frame = self.camera.read()
+            if not ret:
+                break
+            
+            # Get slider values
+            h_low = cv2.getTrackbarPos("H Low", "HSV Tuner - Mask")
+            h_high = cv2.getTrackbarPos("H High", "HSV Tuner - Mask")
+            s_low = cv2.getTrackbarPos("S Low", "HSV Tuner - Mask")
+            s_high = cv2.getTrackbarPos("S High", "HSV Tuner - Mask")
+            v_low = cv2.getTrackbarPos("V Low", "HSV Tuner - Mask")
+            v_high = cv2.getTrackbarPos("V High", "HSV Tuner - Mask")
+            
+            # Create mask with current settings
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            lower = np.array([h_low, s_low, v_low])
+            upper = np.array([h_high, s_high, v_high])
+            mask = cv2.inRange(hsv, lower, upper)
+            
+            # Add text overlay with current values
+            mask_display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            cv2.putText(mask_display, f"H: {h_low}-{h_high}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(mask_display, f"S: {s_low}-{s_high}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(mask_display, f"V: {v_low}-{v_high}", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(mask_display, "Press 'p' to print values", (10, 450),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Show windows
+            cv2.imshow("HSV Tuner - Mask", mask_display)
+            cv2.imshow("HSV Tuner - Original", frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('p'):
+                print("\n" + "="*60)
+                print("📋 CURRENT HSV VALUES:")
+                print("="*60)
+                print(f"self.green_lower = np.array([{h_low}, {s_low}, {v_low}])")
+                print(f"self.green_upper = np.array([{h_high}, {s_high}, {v_high}])")
+                print("="*60 + "\n")
+            elif key == ord('q'):
+                break
+        
+        cv2.destroyWindow("HSV Tuner - Mask")
+        cv2.destroyWindow("HSV Tuner - Original")
+        print("✅ HSV Tuner closed\n")
 
     # ----------------------------------------------------------------
     # BLE Functions
@@ -146,19 +222,14 @@ class GreenPixelTracker:
         loop.run_until_complete(self.connect_ble())
         loop.close()
 
-    async def fast_find_device(self, name_substring="ForceStylus", timeout=0.4):
-        """
-        Try to find quickly by name; returns device or None.
-        Uses find_device_by_filter when available; falls back to discover.
-        """
+    async def fast_find_device(self, name_substring="ForceStylus", timeout=0.25):
+        """Quickly find by name; returns device or None."""
         try:
-            # Newer Bleak has this utility; quicker than full discovery on some OSes
             device = await BleakScanner.find_device_by_filter(
                 lambda d, ad: (d.name and name_substring in d.name), timeout=timeout
             )
             return device
         except Exception:
-            # Fallback: short discovery
             devices = await BleakScanner.discover(timeout=timeout)
             for d in devices:
                 if d.name and name_substring in d.name:
@@ -166,28 +237,26 @@ class GreenPixelTracker:
             return None
 
     def _on_disconnect(self, client):
-        # Called from Bleak transport thread
         print("\n🔌 BLE disconnected (callback).")
         self.ble_connected = False
 
     async def connect_ble(self):
-        """Find and connect to the ESP32 via BLE with fast auto-reconnect"""
-        backoff = 0.3  # very quick retry
+        """Find and connect to the ESP32 via BLE with very fast auto-reconnect"""
+        backoff = 0.2  # quick retry
 
         while self.running:
             print("\n" + "="*60)
-            print("🔍 SCANNING/CONNECTING BLUETOOTH")
+            print("🔍 SCANNING/CONNECTING BLUETOOTH (FAST)")
             print("="*60)
 
             try:
                 device = None
                 if self.device_address:
-                    # Skip scan: connect directly to cached address
                     print(f"   Using cached address: {self.device_address}")
                     device = type("Tmp", (), {"address": self.device_address})()
                 else:
-                    print("   Fast find 'ForceStylus'… (≤0.4s)")
-                    device = await self.fast_find_device("ForceStylus", timeout=0.4)
+                    print("   Fast find 'ForceStylus'… (≤0.25s)")
+                    device = await self.fast_find_device("ForceStylus", timeout=0.25)
 
                 if not device:
                     print("   ❌ Not found. Quick retry…")
@@ -196,36 +265,23 @@ class GreenPixelTracker:
 
                 address = device.address if hasattr(device, "address") else device
                 print(f"\n🔗 Connecting to {address} …")
-                async with BleakClient(address, disconnected_callback=self._on_disconnect, timeout=5.0) as client:
+                async with BleakClient(address, disconnected_callback=self._on_disconnect, timeout=3.0) as client:
                     self.ble_client = client
                     self.ble_connected = True
                     if not self.device_address:
-                        # Cache for future ultra-fast reconnects
-                        self.device_address = address
+                        self.device_address = address  # cache for next time
 
-                    print("✅ Connected successfully!")
-                    print("📡 Subscribing to force sensor notifications…")
+                    print("✅ Connected! Subscribing to force data…")
                     await client.start_notify(CHARACTERISTIC_UUID, self.notification_handler)
                     print("✅ Receiving force data from ESP32!")
 
-                    # Lightweight keep-alive / progress
-                    last_value_print = -1
                     last_data_time = time.monotonic()
-
                     while self.running and client.is_connected:
-                        # Watchdog for data
                         if (time.monotonic() - last_data_time) > 2.0:
                             print("\n⚠️  No data in 2s (still connected)…")
                             last_data_time = time.monotonic()
+                        await asyncio.sleep(0.02)  # cooperative yield
 
-                        if self.force_value != last_value_print:
-                            # Do not spam; only print when visible change
-                            last_value_print = self.force_value
-                            last_data_time = time.monotonic()
-
-                        await asyncio.sleep(0.02)  # 50 Hz cooperative yield
-
-                    # Clean up
                     try:
                         if client.is_connected:
                             await client.stop_notify(CHARACTERISTIC_UUID)
@@ -243,21 +299,46 @@ class GreenPixelTracker:
                     await asyncio.sleep(backoff)
 
     def notification_handler(self, sender, data):
-        """Called whenever ESP32 sends new force data (2 bytes: LSB, MSB)"""
+        """ESP32 sends 2 bytes: LSB, MSB"""
         if len(data) == 2:
             self.force_value = data[0] | (data[1] << 8)
             self.last_data_received = time.time()
+            
+            # Record force value for auto-tuning
+            self.force_history.append(self.force_value)
 
     # ----------------------------------------------------------------
-    # Force Sensor Logic
+    # Force Sensor Logic (with AUTO-TUNING)
     # ----------------------------------------------------------------
+    def update_adaptive_threshold(self):
+        """
+        AUTO-TUNING: Calculates threshold based on recent force history.
+        Uses baseline (low percentile) + sensitivity margin to detect peaks.
+        This adapts to sensor drift automatically!
+        """
+        if not self.auto_tune_enabled:
+            return  # Manual mode: use fixed threshold
+        
+        # Need enough data to calculate baseline
+        if len(self.force_history) < 30:
+            return  # Keep initial threshold until we have history
+        
+        # Calculate baseline: use 30th percentile (ignores high peaks, tracks low/rest state)
+        baseline = np.percentile(self.force_history, self.baseline_percentile)
+        
+        # Set threshold = baseline + sensitivity margin
+        self.force_threshold = int(baseline + self.sensitivity_margin)
+        
+        # Safety bounds: keep threshold reasonable
+        self.force_threshold = max(50, min(900, self.force_threshold))
+    
     def get_line_thickness(self):
         if self.force_value < self.force_threshold:
             return 0
-        force_range = self.force_max - self.force_threshold
+        force_range = max(1, self.force_max - self.force_threshold)
         thickness_range = self.max_thickness - self.min_thickness
         force_above = max(0, self.force_value - self.force_threshold)
-        thickness = self.min_thickness + (force_above / max(1, force_range)) * thickness_range
+        thickness = self.min_thickness + (force_above / force_range) * thickness_range
         return int(max(self.min_thickness, min(self.max_thickness, thickness)))
 
     def is_drawing_enabled(self):
@@ -348,28 +429,38 @@ class GreenPixelTracker:
             return (avg_x, avg_y)
         return position
 
-    def detect_blue(self, frame):
+    def detect_green(self, frame):
         """
-        Detect blue LED with ROI acceleration:
-        - If we have a last position, search a small box around it.
-        - Optional downscale inside ROI to reduce work even more.
+        Fast green LED detection with ROI, V bright-core, top-K cap, and one erode.
+        Returns (cx, cy), mask  or  (None, mask).
         """
         if frame.shape[-1] == 4:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
         H, W = frame.shape[:2]
-        # Choose ROI
-        if self.last_blue_pos_raw is not None:
-            cx, cy = self.last_blue_pos_raw
-            x0 = max(0, cx - self.roi_half)
-            y0 = max(0, cy - self.roi_half)
-            x1 = min(W, cx + self.roi_half)
-            y1 = min(H, cy + self.roi_half)
-            roi = frame[y0:y1, x0:x1]
-            offset = (x0, y0)
-        else:
+
+        # Choose ROI (expand if recently lost, fallback to full frame occasionally)
+        use_full = False
+        now = time.monotonic()
+        if self.last_green_pos_raw is None or (now - self.last_fullframe_check) >= (1.0 / max(1, self.max_fullframe_checks)):
+            use_full = (self.last_green_pos_raw is None)
+            if not use_full and (now - self.last_fullframe_check) >= (1.0 / self.max_fullframe_checks):
+                # periodic full-frame sweep to recover if drifted
+                use_full = True
+                self.last_fullframe_check = now
+
+        if use_full:
             roi = frame
             offset = (0, 0)
+            self.roi_half = self.roi_half_base  # reset after full frame
+        else:
+            cx0, cy0 = self.last_green_pos_raw
+            x0 = max(0, cx0 - self.roi_half)
+            y0 = max(0, cy0 - self.roi_half)
+            x1 = min(W, cx0 + self.roi_half)
+            y1 = min(H, cy0 + self.roi_half)
+            roi = frame[y0:y1, x0:x1]
+            offset = (x0, y0)
 
         # Optional downscale inside ROI
         if self.roi_downscale != 1.0:
@@ -378,30 +469,41 @@ class GreenPixelTracker:
             roi_small = roi
 
         hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.blue_lower, self.blue_upper)
+        h, s, v = cv2.split(hsv)
 
-        # Simple morphology
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        # HSV gate to green
+        mask = cv2.inRange(hsv, self.green_lower, self.green_upper)
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        # Bright-core gate on V channel to ignore glow/bleed
+        if self.V_BRIGHT is not None:
+            bright = cv2.threshold(v, self.V_BRIGHT, 255, cv2.THRESH_BINARY)[1]
+            mask = cv2.bitwise_and(mask, bright)
+
+        # One erode to shrink bloom
+        if self.ERODE_ON:
+            mask = cv2.erode(mask, self.ERODE_K, iterations=1)
+
+        # Collect candidate pixels
+        ys, xs = np.where(mask > 0)
+        if ys.size == 0:
             self.position_history.clear()
+            # widen ROI slightly if lost
+            self.roi_half = min(max(self.roi_half_base, self.roi_half + 10), max(H, W))
             return None, mask
 
-        largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) < self.min_area:
-            self.position_history.clear()
-            return None, mask
+        # Cap to TOP_K brightest to bound work
+        vals = v[ys, xs]
+        K = min(self.TOP_K, vals.size)
+        # np.argpartition is O(n)
+        idx = np.argpartition(vals, -K)[-K:]
+        xs_k = xs[idx]; ys_k = ys[idx]
+        wgt  = vals[idx].astype(np.float32)
 
-        M = cv2.moments(largest)
-        if M["m00"] <= 0:
-            return None, mask
+        # brightness-weighted centroid
+        cx = int(np.average(xs_k, weights=wgt))
+        cy = int(np.average(ys_k, weights=wgt))
 
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
-
-        # Scale back if we downscaled ROI
+        # Scale back if ROI downscaled
         if self.roi_downscale != 1.0:
             cx = int(cx / self.roi_downscale)
             cy = int(cy / self.roi_downscale)
@@ -410,8 +512,9 @@ class GreenPixelTracker:
         cx += offset[0]
         cy += offset[1]
 
-        # Update last raw pos for next ROI
-        self.last_blue_pos_raw = (cx, cy)
+        # Update last raw pos and tighten ROI again
+        self.last_green_pos_raw = (cx, cy)
+        self.roi_half = max(self.roi_half_base, int(self.roi_half_base))  # snap back to base
         return (cx, cy), mask
 
     # ----------------------------------------------------------------
@@ -420,6 +523,7 @@ class GreenPixelTracker:
     def run(self):
         last_frame_marked = None
         last_canvas_display = None
+        show_mask = True  # NEW: Show mask by default to help debugging
 
         while True:
             ret, frame = self.camera.read()
@@ -432,29 +536,31 @@ class GreenPixelTracker:
             # --- PROCESSING: only at proc_fps ---
             if now_ms - self.last_proc_ms >= self.proc_period_ms:
                 self.last_proc_ms = now_ms
+                
+                # AUTO-TUNE: Update threshold based on force history
+                self.update_adaptive_threshold()
 
-                # Only run ArUco detection when calibrating or not calibrated
+                # ArUco only when calibrating or not yet calibrated
                 if (not self.is_calibrated) or self.awaiting_calibration:
                     fiducials, frame_marked = self.detect_fiducials(frame)
                 else:
                     fiducials = None
                     frame_marked = frame.copy()
 
-                # LED detection (fast, uses ROI)
-                blue_pos, _ = self.detect_blue(frame)
-                blue_pos_smoothed = self.smooth_position(blue_pos)
+                # Fast GREEN LED detection (ROI + top-K)
+                green_pos, mask = self.detect_green(frame)  # CHANGED: Keep the mask
+                green_pos_smoothed = self.smooth_position(green_pos)
 
-                # Get drawing parameters from force sensor
                 drawing_enabled = self.is_drawing_enabled()
-                line_thickness = self.get_line_thickness()
+                line_thickness  = self.get_line_thickness()
 
-                # Draw blue LED cursor on camera view
-                if blue_pos_smoothed is not None:
-                    cv2.circle(frame_marked, blue_pos_smoothed, 10, (255, 0, 0), 2)
-                    cv2.circle(frame_marked, blue_pos_smoothed, 3, (255, 0, 0), -1)
+                # Draw LED cursor on camera view
+                if green_pos_smoothed is not None:
+                    cv2.circle(frame_marked, green_pos_smoothed, 10, (0, 255, 0), 2)
+                    cv2.circle(frame_marked, green_pos_smoothed, 3,  (0, 255, 0), -1)
 
                     if self.transform_matrix is not None:
-                        draw_pos = self.transform_point(blue_pos_smoothed)
+                        draw_pos = self.transform_point(green_pos_smoothed)
                         draw_pos = (
                             max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
                             max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
@@ -470,7 +576,7 @@ class GreenPixelTracker:
                     self.last_draw_point = None
                     self.position_history.clear()
 
-                # Status overlays
+                # Status overlays (done at processing rate, not UI rate)
                 if self.is_calibrated:
                     calibrated_text = "CALIBRATED - BLACK CANVAS MODE"
                     calibrated_color = (0, 255, 0)
@@ -486,33 +592,64 @@ class GreenPixelTracker:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, ble_color, 2)
 
                 force_newtons = self.to_newtons(self.force_value)
-                threshold_n = self.to_newtons(self.force_threshold)
-                force_text = f"Force: {self.force_value} ({force_newtons:.3f}N) | Threshold: {self.force_threshold} ({threshold_n:.3f}N)"
+                threshold_n   = self.to_newtons(self.force_threshold)
+                
+                # Show baseline if auto-tuning
+                if self.auto_tune_enabled and len(self.force_history) >= 30:
+                    baseline = np.percentile(self.force_history, self.baseline_percentile)
+                    baseline_n = self.to_newtons(baseline)
+                    force_text = f"Force: {self.force_value} ({force_newtons:.3f}N) | Baseline: {int(baseline)} ({baseline_n:.3f}N) | Thresh: {self.force_threshold}"
+                else:
+                    force_text = f"Force: {self.force_value} ({force_newtons:.3f}N) | Threshold: {self.force_threshold} ({threshold_n:.3f}N)"
+                
                 cv2.putText(frame_marked, force_text, (30, 200),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                # Auto-tune status
+                auto_tune_text = f"AUTO-TUNE: {'ON' if self.auto_tune_enabled else 'OFF'} | Sensitivity: +{self.sensitivity_margin}"
+                auto_tune_color = (0, 255, 0) if self.auto_tune_enabled else (128, 128, 128)
+                cv2.putText(frame_marked, auto_tune_text, (30, 230),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, auto_tune_color, 2)
 
-                drawing_text = f"DRAWING: {'ON' if drawing_enabled else 'OFF'} (Thickness: {line_thickness}px)"
+                drawing_text  = f"DRAWING: {'ON' if drawing_enabled else 'OFF'} (Thickness: {line_thickness}px)"
                 drawing_color = (0, 255, 255) if drawing_enabled else (128, 128, 128)
-                cv2.putText(frame_marked, drawing_text, (30, 240),
+                cv2.putText(frame_marked, drawing_text, (30, 260),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, drawing_color, 2)
+
+                # NEW: Detection status
+                detection_text = "GREEN DETECTED" if green_pos is not None else "NO GREEN DETECTED"
+                detection_color = (0, 255, 0) if green_pos is not None else (0, 0, 255)
+                cv2.putText(frame_marked, detection_text, (30, 290),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, detection_color, 2)
 
                 # Compose canvas display with cursor
                 canvas_display = self.canvas.copy()
-                if blue_pos_smoothed is not None and self.transform_matrix is not None:
-                    draw_pos = self.transform_point(blue_pos_smoothed)
+                if green_pos_smoothed is not None and self.transform_matrix is not None:
+                    draw_pos = self.transform_point(green_pos_smoothed)
                     draw_pos = (
                         max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
                         max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
                     )
                     cursor_radius = max(5, line_thickness + 2)
-                    cursor_color = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
+                    cursor_color  = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
                     if not drawing_enabled:
                         cursor_color = (128, 128, 128)
                     cv2.circle(canvas_display, draw_pos, cursor_radius, cursor_color, 2)
                     cv2.circle(canvas_display, draw_pos, 3, cursor_color, -1)
 
-                last_frame_marked = frame_marked
+                last_frame_marked   = frame_marked
                 last_canvas_display = canvas_display
+                
+                # NEW: Show detection mask for debugging
+                if show_mask:
+                    # Resize mask to match ROI if needed, or show as-is
+                    mask_display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                    # Add helper text
+                    cv2.putText(mask_display, "WHITE = Detected Green", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(mask_display, "Press 'm' to hide", (10, 60),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.imshow("Green Detection Mask (Debugging)", mask_display)
 
                 # Handle calibration trigger (only after processing step)
                 if self.awaiting_calibration and fiducials is not None:
@@ -525,7 +662,7 @@ class GreenPixelTracker:
                 if last_canvas_display is not None:
                     cv2.imshow("Drawing Canvas (Project This)", last_canvas_display)
 
-            key = cv2.waitKey(1) & 0xFF  # small wait; we're pacing via fps gates
+            key = cv2.waitKey(1) & 0xFF  # small wait; pacing via fps gates
             if key == ord('q'):
                 break
             elif key == ord('c'):
@@ -533,7 +670,7 @@ class GreenPixelTracker:
                 self.awaiting_calibration = True
                 self.is_calibrated = False
                 self.canvas = self._make_fiducial_canvas()
-                print("📐 Calibration mode: show all 4 ArUco markers, then press 'c' again if needed.")
+                print("📐 Calibration mode: show all 4 ArUco markers.")
             elif key == ord('r'):
                 if self.is_calibrated:
                     self.canvas = self._make_clean_canvas()
@@ -542,14 +679,44 @@ class GreenPixelTracker:
                     self.canvas = self._make_fiducial_canvas()
                     print("🎨 Canvas reset (showing calibration markers)")
                 self.last_draw_point = None
+            elif key == ord('a'):
+                # Toggle auto-tuning
+                self.auto_tune_enabled = not self.auto_tune_enabled
+                status = "ENABLED" if self.auto_tune_enabled else "DISABLED"
+                print(f"🤖 Auto-tune: {status}")
+                if not self.auto_tune_enabled:
+                    print(f"   Manual threshold locked at: {self.force_threshold}")
             elif key == ord('+') or key == ord('='):
-                self.force_threshold += 25
-                threshold_n = self.to_newtons(self.force_threshold)
-                print(f"⬆️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N)")
+                # Increase sensitivity (lower threshold = more sensitive)
+                if self.auto_tune_enabled:
+                    self.sensitivity_margin += 25
+                    print(f"⬆️  Sensitivity: +{self.sensitivity_margin} above baseline (more force needed)")
+                else:
+                    self.force_threshold += 25
+                    threshold_n = self.to_newtons(self.force_threshold)
+                    print(f"⬆️  Manual threshold: {self.force_threshold} ({threshold_n:.3f}N)")
             elif key == ord('-') or key == ord('_'):
-                self.force_threshold = max(0, self.force_threshold - 25)
-                threshold_n = self.to_newtons(self.force_threshold)
-                print(f"⬇️  Force threshold: {self.force_threshold} ({threshold_n:.3f}N)")
+                # Decrease sensitivity (higher threshold = less sensitive)
+                if self.auto_tune_enabled:
+                    self.sensitivity_margin = max(25, self.sensitivity_margin - 25)
+                    print(f"⬇️  Sensitivity: +{self.sensitivity_margin} above baseline (less force needed)")
+                else:
+                    self.force_threshold = max(0, self.force_threshold - 25)
+                    threshold_n = self.to_newtons(self.force_threshold)
+                    print(f"⬇️  Manual threshold: {self.force_threshold} ({threshold_n:.3f}N)")
+            elif key == ord('m'):
+                # NEW: Toggle mask display
+                show_mask = not show_mask
+                if not show_mask:
+                    cv2.destroyWindow("Green Detection Mask (Debugging)")
+                print(f"🎭 Mask display: {'ON' if show_mask else 'OFF'}")
+            elif key == ord('t'):
+                # NEW: Launch HSV tuner
+                print("🎨 Launching HSV tuner...")
+                cv2.destroyAllWindows()
+                self.test_color_range()
+                # Recreate main windows after tuner closes
+                print("🔄 Returning to main application...")
 
         # Cleanup
         self.running = False
