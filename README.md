@@ -1,4 +1,9 @@
 # STARDUST: Behind the Scenes
+
+[![Watch the video](https://www.youtube.com/watch?v=CYAAUwyI8sE)](https://www.youtube.com/watch?v=CYAAUwyI8sE)
+
+https://www.youtube.com/watch?v=CYAAUwyI8sE
+
 ## Meet the Team
 Our team consists of Matthew, Luke, Arya, and Andrew. We are all freshmen, and we were so excited going into our first hackathon! None of us are CS, so this weekend was a learning curve for all of us. It was so fun to participate and be able to make a functioning product! We did not assign specific roles; however, Luke refined the CAD design of our case while Matthew, Arya, and Andrew focused on the electronics and embedded system design.
 
