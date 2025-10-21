@@ -90,6 +90,10 @@ class GreenPixelTracker:
         print(f"   ✅ Canvas created: {self.canvas_size[1]}x{self.canvas_size[0]}")
         print("   ArUco markers placed at corners")
 
+        # ---------- Undo History ----------
+        self.canvas_history = deque(maxlen=50)  # Store last 50 states
+        self.save_canvas_state()  # Save initial state
+
         # ---------- Smoothing ----------
         self.position_history = deque(maxlen=5)
         self.last_green_pos_raw = None  # for ROI seeding
@@ -120,7 +124,7 @@ class GreenPixelTracker:
         self.auto_tune_enabled = True  # Toggle with 'a' key
         
         self.min_thickness = 1
-        self.max_thickness = 15
+        self.max_thickness = 30  # DOUBLED from 15 to 30 for more sensitivity
         self.eraser_multiplier = 2.5  # Eraser is 2.5x larger than brush
         self.force_max = 1024
         self.sensor_max_newtons = 1.0
@@ -143,7 +147,7 @@ class GreenPixelTracker:
         print("✅ SYSTEM READY")
         print("="*60)
         print("⌨️  Calibration: [C]alibrate")
-        print("⌨️  Drawing: [B]rush | [E]raser | [X]Clear canvas")
+        print("⌨️  Drawing: [B]rush | [E]raser | [X]Clear | [U]ndo")
         print("⌨️  Settings: [+/-]Sensitivity | [A]uto-tune | [R]eset")
         print("⌨️  Debug: [M]ask | [T]HSV tuner | [Q]uit")
         print("="*60 + "\n")
@@ -381,6 +385,19 @@ class GreenPixelTracker:
     def _make_clean_canvas(self):
         return np.zeros((self.canvas_size[0], self.canvas_size[1], 3), dtype=np.uint8)
 
+    def save_canvas_state(self):
+        """Save current canvas state for undo"""
+        self.canvas_history.append(self.canvas.copy())
+
+    def undo(self):
+        """Restore previous canvas state"""
+        if len(self.canvas_history) > 1:  # Keep at least one state
+            self.canvas_history.pop()  # Remove current state
+            self.canvas = self.canvas_history[-1].copy()  # Restore previous
+            print("↩️  Undo successful")
+        else:
+            print("⚠️  Nothing to undo")
+
     def detect_fiducials(self, frame):
         """Detect ArUco markers (only called in calibration mode)"""
         if frame.shape[-1] == 4:
@@ -421,6 +438,7 @@ class GreenPixelTracker:
         self.is_calibrated = True
         self.awaiting_calibration = False
         self.canvas = self._make_clean_canvas()
+        self.save_canvas_state()  # Save clean canvas state after calibration
         print("\n" + "="*60)
         print("✅ CALIBRATION SUCCESSFUL!")
         print("="*60)
@@ -537,6 +555,7 @@ class GreenPixelTracker:
         last_frame_marked = None
         last_canvas_display = None
         show_mask = True  # Show mask by default to help debugging
+        was_drawing = False  # Track if we were drawing in the last frame
 
         while True:
             ret, frame = self.camera.read()
@@ -579,6 +598,11 @@ class GreenPixelTracker:
                             max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
                         )
                         if drawing_enabled and line_thickness > 0:
+                            # Save canvas state at the start of a new stroke
+                            if not was_drawing:
+                                self.save_canvas_state()
+                                was_drawing = True
+                            
                             if self.last_draw_point is not None:
                                 # Choose color based on mode
                                 if self.drawing_mode == self.BRUSH_MODE:
@@ -591,9 +615,11 @@ class GreenPixelTracker:
                             self.last_draw_point = draw_pos
                         else:
                             self.last_draw_point = None
+                            was_drawing = False
                 else:
                     self.last_draw_point = None
                     self.position_history.clear()
+                    was_drawing = False
 
                 # Status overlays (done at processing rate, not UI rate)
                 if self.is_calibrated:
@@ -645,7 +671,7 @@ class GreenPixelTracker:
                 h, w = frame_marked.shape[:2]
                 keybind_y_start = h - 80
                 cv2.rectangle(frame_marked, (0, keybind_y_start - 10), (w, h), (0, 0, 0), -1)  # Black background
-                cv2.putText(frame_marked, "KEYS: [B]rush | [E]raser | [X]Clear | [C]alibrate | [+/-]Sensitivity | [Q]uit", 
+                cv2.putText(frame_marked, "KEYS: [B]rush | [E]raser | [X]Clear | [U]ndo | [C]alibrate | [+/-]Sensitivity | [Q]uit", 
                            (10, keybind_y_start + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(frame_marked, "      [R]eset | [A]uto-tune | [M]ask | [T]HSV Tuner", 
                            (10, keybind_y_start + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
@@ -710,9 +736,14 @@ class GreenPixelTracker:
                 # Clear canvas
                 if self.is_calibrated:
                     self.canvas = self._make_clean_canvas()
+                    self.save_canvas_state()
                     print("🗑️  Canvas cleared!")
                 else:
                     print("⚠️  Calibrate first before clearing")
+                self.last_draw_point = None
+            elif key == ord('u'):
+                # Undo last action
+                self.undo()
                 self.last_draw_point = None
             elif key == ord('c'):
                 # Enter calibration mode: show markers and start detecting
@@ -723,6 +754,7 @@ class GreenPixelTracker:
             elif key == ord('r'):
                 if self.is_calibrated:
                     self.canvas = self._make_clean_canvas()
+                    self.save_canvas_state()
                     print("🎨 Drawing reset (clean black canvas)")
                 else:
                     self.canvas = self._make_fiducial_canvas()
