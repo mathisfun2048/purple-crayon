@@ -5,6 +5,7 @@ import asyncio
 from bleak import BleakClient, BleakScanner
 import threading
 import time
+import os  # NEW: For file path validation
 
 # BLE UUIDs - MUST match the ESP32 code
 SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -32,9 +33,10 @@ class GreenPixelTracker:
 
         # Top-K & bright-core gating to limit pixels used for centroid
         self.TOP_K      = 200         # cap pixels used for centroid (fast & stable)
-        self.V_BRIGHT   = 100         # LOWERED: V-channel threshold (was 170, now more sensitive)
+        self.V_BRIGHT   = 150         # INCREASED: V-channel threshold to reduce false positives (was 100)
         self.ERODE_ON   = True        # one erode to shrink bloom
         self.ERODE_K    = np.ones((3,3), np.uint8)
+        self.MIN_DETECTION_AREA = 15  # NEW: Minimum pixel count to consider a detection valid
 
         # ---------- Camera Setup ----------
         camera_index = 1
@@ -112,6 +114,42 @@ class GreenPixelTracker:
         self.ERASER_MODE = 1
         self.drawing_mode = self.BRUSH_MODE
 
+        # ========== NEW: COLOR PALETTE ==========
+        # Define 5 colors that users can select with keys 1-5
+        # Each color is in BGR format (Blue, Green, Red) - that's how OpenCV stores colors
+        self.color_palette = {
+            1: (255, 255, 255),  # White (B=255, G=255, R=255)
+            2: (0, 0, 255),      # Red (B=0, G=0, R=255)
+            3: (0, 255, 0),      # Green (B=0, G=255, R=0)
+            4: (255, 0, 0),      # Blue (B=255, G=0, R=0)
+            5: (0, 255, 255),    # Yellow (B=0, G=255, R=255)
+        }
+        # Color names for display (matching the keys above)
+        self.color_names = {
+            1: "White",
+            2: "Red", 
+            3: "Green",
+            4: "Blue",
+            5: "Yellow"
+        }
+        # Start with white color (key 1)
+        self.current_color = self.color_palette[1]
+        self.current_color_key = 1
+        print("\n🎨 Color palette initialized:")
+        print("   [1] White  [2] Red  [3] Green  [4] Blue  [5] Yellow")
+
+        # ========== NEW: IMAGE PASTING FEATURE ==========
+        # This will store the image that the user wants to paste
+        self.paste_image = None
+        # This controls the size of the pasted image (you can adjust this)
+        self.paste_image_size = 150  # pixels width/height (default)
+        self.paste_size_min = 50      # Minimum paste size
+        self.paste_size_max = 500     # Maximum paste size
+        self.paste_size_step = 25     # How much to change size each time
+        print("\n🖼️  Image pasting feature ready")
+        print("   Press [I] to enter image file path, then [P] to paste at cursor")
+        print(f"   Press [ ] to decrease/increase paste size (current: {self.paste_image_size}px)")
+
         # ---------- Force Sensor Setup ----------
         print("\n⚡ Force sensor configuration...")
         self.force_value = 0
@@ -148,9 +186,172 @@ class GreenPixelTracker:
         print("="*60)
         print("⌨️  Calibration: [C]alibrate")
         print("⌨️  Drawing: [B]rush | [E]raser | [X]Clear | [U]ndo")
+        print("⌨️  Colors: [1]White [2]Red [3]Green [4]Blue [5]Yellow")
+        print("⌨️  Images: [I]Enter image path | [P]aste at cursor | [ ]Size-/+")
         print("⌨️  Settings: [+/-]Sensitivity | [A]uto-tune | [R]eset")
-        print("⌨️  Debug: [M]ask | [T]HSV tuner | [Q]uit")
+        print("⌨️  Debug: [M]ask | [T]HSV tuner | [,/.]Brightness | [Q]uit")
         print("="*60 + "\n")
+
+    # ----------------------------------------------------------------
+    # NEW: Image Loading and Pasting Functions
+    # ----------------------------------------------------------------
+    def change_paste_size(self, increase=True):
+        """
+        Change the size of pasted images.
+        If an image is already loaded, it will be re-resized.
+        
+        increase: True to increase size, False to decrease
+        """
+        old_size = self.paste_image_size
+        
+        if increase:
+            # Increase size (up to maximum)
+            self.paste_image_size = min(self.paste_size_max, 
+                                       self.paste_image_size + self.paste_size_step)
+        else:
+            # Decrease size (down to minimum)
+            self.paste_image_size = max(self.paste_size_min, 
+                                       self.paste_image_size - self.paste_size_step)
+        
+        # Check if size actually changed
+        if old_size == self.paste_image_size:
+            if increase:
+                print(f"⚠️  Maximum paste size reached: {self.paste_size_max}px")
+            else:
+                print(f"⚠️  Minimum paste size reached: {self.paste_size_min}px")
+            return
+        
+        # Print new size
+        direction = "increased" if increase else "decreased"
+        print(f"📏 Paste size {direction}: {self.paste_image_size}px (was {old_size}px)")
+        
+        # If an image is already loaded, re-resize it to the new size
+        if self.paste_image is not None:
+            # If we have the original image, resize from that (better quality)
+            if hasattr(self, 'original_paste_image'):
+                self.paste_image = cv2.resize(self.original_paste_image, 
+                                             (self.paste_image_size, self.paste_image_size))
+                print(f"   ✅ Loaded image resized to {self.paste_image_size}x{self.paste_image_size}")
+            else:
+                # No original, resize from current (may lose quality)
+                self.paste_image = cv2.resize(self.paste_image, 
+                                             (self.paste_image_size, self.paste_image_size))
+                print(f"   ⚠️  Image resized (may have quality loss)")
+                print("   Tip: Reload with [I] for best quality at this size")
+    
+    def load_image(self):
+        """
+        Prompts user to enter an image file path via terminal.
+        The image is loaded and stored in self.paste_image.
+        """
+        print("\n" + "="*60)
+        print("📂 LOAD IMAGE")
+        print("="*60)
+        print("Enter the full path to your image file.")
+        print("TIP: You can drag and drop the file into the terminal!")
+        print("Example: /Users/yourname/Pictures/image.png")
+        print("Press Enter without typing anything to cancel.")
+        print("="*60)
+        
+        # Get file path from user
+        file_path = input("Image path: ").strip()
+        
+        # Remove quotes if user copy-pasted with quotes
+        file_path = file_path.strip('"').strip("'")
+        
+        # Check if user cancelled
+        if not file_path:
+            print("⚠️  Cancelled - no file path entered")
+            return
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            print(f"❌ File not found: {file_path}")
+            print("   Make sure the path is correct and try again")
+            return
+        
+        # Try to load the image using OpenCV
+        img = cv2.imread(file_path)
+        
+        if img is not None:
+            # Image loaded successfully!
+            # Store the original image so we can re-resize it later without quality loss
+            self.original_paste_image = img.copy()
+            
+            # Resize it to our standard paste size for consistency
+            # cv2.resize changes the image dimensions
+            self.paste_image = cv2.resize(img, (self.paste_image_size, self.paste_image_size))
+            print(f"✅ Image loaded successfully!")
+            print(f"   Resized to {self.paste_image_size}x{self.paste_image_size} pixels")
+            print("   Press [P] when cursor is where you want to paste")
+            print("   Press [ or ] to change paste size")
+        else:
+            print(f"❌ Failed to load image: {file_path}")
+            print("   Make sure it's a valid image file (PNG, JPG, etc.)")
+        
+        print("="*60 + "\n")
+    
+    def paste_image_at_cursor(self, cursor_pos):
+        """
+        Pastes the loaded image onto the canvas at the cursor position.
+        The image is centered on the cursor.
+        
+        cursor_pos: (x, y) tuple of where to paste the image
+        """
+        # Check if we have an image to paste
+        if self.paste_image is None:
+            print("⚠️  No image loaded! Press [I] to load an image first")
+            return
+        
+        # Check if we're calibrated (we need the transform to work)
+        if not self.is_calibrated:
+            print("⚠️  Please calibrate first (press [C])")
+            return
+        
+        # Save canvas state for undo functionality
+        self.save_canvas_state()
+        
+        # Get the image dimensions
+        img_h, img_w = self.paste_image.shape[:2]
+        
+        # Calculate top-left corner position to center the image on cursor
+        # We subtract half the width and height to center it
+        x = cursor_pos[0] - img_w // 2  # // means integer division
+        y = cursor_pos[1] - img_h // 2
+        
+        # Calculate bottom-right corner
+        x_end = x + img_w
+        y_end = y + img_h
+        
+        # Make sure we don't paste outside the canvas bounds
+        # We need to clip the coordinates to stay within canvas
+        
+        # Clipping for canvas boundaries
+        canvas_h, canvas_w = self.canvas.shape[:2]
+        
+        # Calculate how much of the image fits in the canvas
+        # If image goes off-screen, we only paste the visible part
+        src_x_start = max(0, -x)  # If x is negative, start from this pixel in source image
+        src_y_start = max(0, -y)  # If y is negative, start from this pixel in source image
+        src_x_end = img_w - max(0, x_end - canvas_w)  # If goes past right edge
+        src_y_end = img_h - max(0, y_end - canvas_h)  # If goes past bottom edge
+        
+        # Adjust paste position to canvas bounds
+        dst_x_start = max(0, x)
+        dst_y_start = max(0, y)
+        dst_x_end = min(canvas_w, x_end)
+        dst_y_end = min(canvas_h, y_end)
+        
+        # Extract the portion of image that fits
+        img_portion = self.paste_image[src_y_start:src_y_end, src_x_start:src_x_end]
+        
+        # Paste the image onto the canvas
+        # We directly copy the pixels from the image to the canvas
+        try:
+            self.canvas[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = img_portion
+            print(f"✅ Image pasted at ({cursor_pos[0]}, {cursor_pos[1]})")
+        except Exception as e:
+            print(f"❌ Error pasting image: {e}")
 
     # ----------------------------------------------------------------
     # HSV Tuner for finding exact color values
@@ -516,7 +717,9 @@ class GreenPixelTracker:
 
         # Collect candidate pixels
         ys, xs = np.where(mask > 0)
-        if ys.size == 0:
+        
+        # NEW: Check if we have enough pixels to be a valid detection
+        if ys.size < self.MIN_DETECTION_AREA:
             self.position_history.clear()
             # widen ROI slightly if lost
             self.roi_half = min(max(self.roi_half_base, self.roi_half + 10), max(H, W))
@@ -556,6 +759,9 @@ class GreenPixelTracker:
         last_canvas_display = None
         show_mask = True  # Show mask by default to help debugging
         was_drawing = False  # Track if we were drawing in the last frame
+        
+        # Track cursor position for image pasting
+        current_canvas_cursor = None
 
         while True:
             ret, frame = self.camera.read()
@@ -597,6 +803,10 @@ class GreenPixelTracker:
                             max(0, min(self.canvas_size[1] - 1, draw_pos[0])),
                             max(0, min(self.canvas_size[0] - 1, draw_pos[1]))
                         )
+                        
+                        # Store cursor position for pasting
+                        current_canvas_cursor = draw_pos
+                        
                         if drawing_enabled and line_thickness > 0:
                             # Save canvas state at the start of a new stroke
                             if not was_drawing:
@@ -604,9 +814,10 @@ class GreenPixelTracker:
                                 was_drawing = True
                             
                             if self.last_draw_point is not None:
+                                # ========== MODIFIED: Use current_color instead of fixed white ==========
                                 # Choose color based on mode
                                 if self.drawing_mode == self.BRUSH_MODE:
-                                    color = (255, 255, 255)  # White for brush
+                                    color = self.current_color  # Use selected color
                                 else:  # ERASER_MODE
                                     color = (0, 0, 0)  # Black for eraser
                                 
@@ -620,6 +831,7 @@ class GreenPixelTracker:
                     self.last_draw_point = None
                     self.position_history.clear()
                     was_drawing = False
+                    current_canvas_cursor = None
 
                 # Status overlays (done at processing rate, not UI rate)
                 if self.is_calibrated:
@@ -661,20 +873,42 @@ class GreenPixelTracker:
                 cv2.putText(frame_marked, drawing_text, (30, 260),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, drawing_color, 2)
                 
+                # LED brightness threshold (for debugging cursor issues)
+                brightness_text = f"LED Brightness Filter: {self.V_BRIGHT} (use ,/. to adjust)"
+                cv2.putText(frame_marked, brightness_text, (30, 290),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 255, 128), 2)
+                
                 # Drawing mode indicator
                 mode_text = f"MODE: {'BRUSH' if self.drawing_mode == self.BRUSH_MODE else 'ERASER'}"
                 mode_color = (255, 255, 255) if self.drawing_mode == self.BRUSH_MODE else (0, 165, 255)
-                cv2.putText(frame_marked, mode_text, (30, 290),
+                cv2.putText(frame_marked, mode_text, (30, 320),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, mode_color, 2)
+                
+                # ========== NEW: Color indicator ==========
+                color_name = self.color_names[self.current_color_key]
+                color_text = f"COLOR: {color_name} (Key {self.current_color_key})"
+                # Draw the text in the actual color (with white outline for visibility)
+                cv2.putText(frame_marked, color_text, (30, 351),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)  # Black outline
+                cv2.putText(frame_marked, color_text, (30, 350),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.current_color, 2)
+                
+                # ========== NEW: Image pasting status ==========
+                if self.paste_image is not None:
+                    paste_text = f"IMAGE LOADED ({self.paste_image_size}x{self.paste_image_size}px) - Press [P] to paste | [ ] to resize"
+                    cv2.putText(frame_marked, paste_text, (30, 380),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 # Keybinds at the bottom of the screen
                 h, w = frame_marked.shape[:2]
-                keybind_y_start = h - 80
+                keybind_y_start = h - 110  # Made taller for more lines
                 cv2.rectangle(frame_marked, (0, keybind_y_start - 10), (w, h), (0, 0, 0), -1)  # Black background
                 cv2.putText(frame_marked, "KEYS: [B]rush | [E]raser | [X]Clear | [U]ndo | [C]alibrate | [+/-]Sensitivity | [Q]uit", 
                            (10, keybind_y_start + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(frame_marked, "      [R]eset | [A]uto-tune | [M]ask | [T]HSV Tuner", 
+                cv2.putText(frame_marked, "      [R]eset | [A]uto-tune | [M]ask | [T]HSV Tuner | [,/.]Brightness", 
                            (10, keybind_y_start + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                cv2.putText(frame_marked, "      [1-5]Colors | [I]Load Image | [P]aste Image | [ ]Resize", 
+                           (10, keybind_y_start + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
                 # Compose canvas display with cursor
                 canvas_display = self.canvas.copy()
@@ -686,9 +920,10 @@ class GreenPixelTracker:
                     )
                     cursor_radius = max(5, line_thickness + 2)
                     
+                    # ========== MODIFIED: Cursor shows current color ==========
                     # Cursor color based on mode
                     if self.drawing_mode == self.BRUSH_MODE:
-                        cursor_color = (255, 255, 255) if self.is_calibrated else (0, 165, 255)
+                        cursor_color = self.current_color if self.is_calibrated else (0, 165, 255)
                     else:  # ERASER_MODE
                         cursor_color = (0, 165, 255)  # Orange for eraser
                     
@@ -704,10 +939,41 @@ class GreenPixelTracker:
                 # Show detection mask for debugging
                 if show_mask:
                     mask_display = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+                    
+                    # Count total white pixels in mask
+                    total_pixels = np.count_nonzero(mask)
+                    
+                    # Draw detection info
                     cv2.putText(mask_display, "WHITE = Detected Green", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(mask_display, "Press 'm' to hide", (10, 60),
+                    cv2.putText(mask_display, f"Pixels detected: {total_pixels}", (10, 60),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    cv2.putText(mask_display, f"Min required: {self.MIN_DETECTION_AREA}", (10, 90),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    # Show detection status
+                    if green_pos is not None:
+                        status_text = f"TRACKING at ({green_pos[0]}, {green_pos[1]})"
+                        status_color = (0, 255, 0)
+                    else:
+                        if total_pixels > 0:
+                            status_text = f"REJECTED (too few pixels)"
+                            status_color = (0, 165, 255)
+                        else:
+                            status_text = "NO DETECTION"
+                            status_color = (0, 0, 255)
+                    
+                    cv2.putText(mask_display, status_text, (10, 120),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                    
+                    # Draw detection point if found
+                    if green_pos is not None:
+                        cv2.circle(mask_display, green_pos, 10, (0, 255, 0), 2)
+                        cv2.circle(mask_display, green_pos, 3, (0, 255, 0), -1)
+                    
+                    cv2.putText(mask_display, "Press 'm' to hide | 't' for HSV tuner", (10, mask_display.shape[0] - 20),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
                     cv2.imshow("Green Detection Mask (Debugging)", mask_display)
 
                 # Handle calibration trigger (only after processing step)
@@ -798,6 +1064,47 @@ class GreenPixelTracker:
                 self.test_color_range()
                 # Recreate main windows after tuner closes
                 print("🔄 Returning to main application...")
+            
+            # ========== NEW: Color selection keys (1-5) ==========
+            elif key in [ord('1'), ord('2'), ord('3'), ord('4'), ord('5')]:
+                # Convert ASCII code to number (1-5)
+                color_key = int(chr(key))
+                self.current_color = self.color_palette[color_key]
+                self.current_color_key = color_key
+                color_name = self.color_names[color_key]
+                print(f"🎨 Color changed to: {color_name}")
+            
+            # ========== NEW: Image pasting keys ==========
+            elif key == ord('i'):
+                # Load an image
+                self.load_image()
+            
+            elif key == ord('p'):
+                # Paste image at cursor position
+                if current_canvas_cursor is not None:
+                    self.paste_image_at_cursor(current_canvas_cursor)
+                else:
+                    print("⚠️  Cursor not detected - cannot paste image")
+            
+            # ========== NEW: Image size adjustment keys ==========
+            elif key == ord('['):
+                # Decrease paste image size
+                self.change_paste_size(increase=False)
+            
+            elif key == ord(']'):
+                # Increase paste image size
+                self.change_paste_size(increase=True)
+            
+            # ========== NEW: Brightness threshold adjustment ==========
+            elif key == ord(',') or key == ord('<'):
+                # Decrease V_BRIGHT threshold (more sensitive, detects more)
+                self.V_BRIGHT = max(50, self.V_BRIGHT - 10)
+                print(f"🔆 Brightness threshold: {self.V_BRIGHT} (more sensitive)")
+            
+            elif key == ord('.') or key == ord('>'):
+                # Increase V_BRIGHT threshold (less sensitive, detects less)
+                self.V_BRIGHT = min(255, self.V_BRIGHT + 10)
+                print(f"🔆 Brightness threshold: {self.V_BRIGHT} (less sensitive)")
 
         # Cleanup
         self.running = False
